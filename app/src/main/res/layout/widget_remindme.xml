@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#161619"
+    android:orientation="vertical"
+    android:padding="20dp"
+    android:gravity="center_vertical">
+
+    <!-- כותרת האפליקציה בגדול למעלה בזהב -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="RemindMe"
+        android:textColor="#E6C687"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:letterSpacing="0.05"
+        android:layout_marginBottom="12dp" />
+
+    <!-- תצוגת התזכורת -->
+    <TextView
+        android:id="@+id/widget_reminder_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="אין תזכורות קרובות"
+        android:textColor="#F8F8FA"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:maxLines="2"
+        android:ellipsize="end" />
+
+</LinearLayout>
