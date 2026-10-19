@@ -21,20 +21,29 @@ data class WeatherInfo(
     val weatherIcon: String,
     val feelsLike: Int,
     val hourlyForecast: List<HourlyItem>,
-    val weeklyForecast: List<Triple<String, String, String>>
+    val weeklyForecast: List<Triple<String, String, String>>,
+    val currentTime: String
 )
 
 object WeatherManager {
 
     suspend fun fetchRealWeather(context: Context, lang: String): WeatherInfo = withContext(Dispatchers.IO) {
         try {
-            val ipResponse = URL("https://ipapi.co/json/").readText()
+            val ipResponse = URL("https://ipwho.is/").readText()
             val ipJson = JSONObject(ipResponse)
 
             val city = ipJson.optString("city", "Netanya")
-            val country = ipJson.optString("country_name", "Israel")
+            val country = ipJson.optString("country", "Israel")
             val latitude = ipJson.optDouble("latitude", 32.0853)
             val longitude = ipJson.optDouble("longitude", 34.7818)
+
+            val timezoneObj = ipJson.optJSONObject("timezone")
+            val timezoneId = timezoneObj?.optString("id", "Asia/Jerusalem") ?: "Asia/Jerusalem"
+
+            val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+                timeZone = TimeZone.getTimeZone(timezoneId)
+            }
+            val exactLocalTime = timeFormat.format(Date())
 
             val displayName = when (lang) {
                 "he" -> if (country == "Israel") "ישראל • $city" else "$country • $city"
@@ -43,7 +52,6 @@ object WeatherManager {
                 else -> "$country • $city"
             }
 
-            // פנייה ל-Open-Meteo כולל נתונים שעתיים ויומיים
             val weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=$latitude&longitude=$longitude&current=temperature_2m,apparent_temperature,weather_code&hourly=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto"
             val weatherResponse = URL(weatherUrl).readText()
             val weatherJson = JSONObject(weatherResponse)
@@ -55,14 +63,13 @@ object WeatherManager {
 
             val (conditionText, icon) = getWeatherDescriptionAndIcon(weatherCode, lang)
 
-            // שליפת תחזית שעתית
             val hourly = weatherJson.getJSONObject("hourly")
             val timeArray = hourly.getJSONArray("time")
             val tempArray = hourly.getJSONArray("temperature_2m")
             val codeArray = hourly.getJSONArray("weather_code")
 
             val hourlyList = mutableListOf<HourlyItem>()
-            val nowIndex = maxOf(0, Calendar.getInstance().get(Calendar.HOUR_OF_DAY))
+            val nowIndex = maxOf(0, Calendar.getInstance(TimeZone.getTimeZone(timezoneId)).get(Calendar.HOUR_OF_DAY))
 
             for (i in nowIndex until minOf(nowIndex + 6, timeArray.length())) {
                 val timeStrFull = timeArray.getString(i)
@@ -80,7 +87,6 @@ object WeatherManager {
                 hourlyList.add(HourlyItem(displayTime, hIcon, temp))
             }
 
-            // תחזית יומית עם תמיכה בשפות עבור התאריכים
             val daily = weatherJson.getJSONObject("daily")
             val dailyTimes = daily.getJSONArray("time")
             val maxTemps = daily.getJSONArray("temperature_2m_max")
@@ -95,7 +101,6 @@ object WeatherManager {
                 val code = dailyCodes.getInt(i)
                 val (_, dayIcon) = getWeatherDescriptionAndIcon(code, lang)
 
-                // המרת התאריך לשפה הנבחרת
                 val formattedDate = formatDate(dateStr, lang)
                 weeklyList.add(Triple(formattedDate, dayIcon, "$maxT°C / $minT°C"))
             }
@@ -107,7 +112,8 @@ object WeatherManager {
                 weatherIcon = icon,
                 feelsLike = feelsLikeTemp,
                 hourlyForecast = hourlyList,
-                weeklyForecast = weeklyList
+                weeklyForecast = weeklyList,
+                currentTime = exactLocalTime
             )
         } catch (e: Exception) {
             e.printStackTrace()
@@ -118,7 +124,8 @@ object WeatherManager {
                 weatherIcon = "☀️",
                 feelsLike = 28,
                 hourlyForecast = listOf(HourlyItem("Now", "☀️", 26)),
-                weeklyForecast = listOf(Triple("Today", "☀️", "28°C / 23°C"))
+                weeklyForecast = listOf(Triple("Today", "☀️", "28°C / 23°C")),
+                currentTime = "16:38"
             )
         }
     }
@@ -165,90 +172,7 @@ object WeatherManager {
                         }
                         "יום $hebrewDay, $day $hebrewMonth"
                     }
-                    "ru" -> {
-                        val ruDay = when (dayOfWeek) {
-                            Calendar.SUNDAY -> "Вс"
-                            Calendar.MONDAY -> "Пн"
-                            Calendar.TUESDAY -> "Вт"
-                            Calendar.WEDNESDAY -> "Ср"
-                            Calendar.THURSDAY -> "Чт"
-                            Calendar.FRIDAY -> "Пт"
-                            Calendar.SATURDAY -> "Сб"
-                            else -> ""
-                        }
-                        val ruMonth = when (month) {
-                            0 -> "янв."
-                            1 -> "февр."
-                            2 -> "марта"
-                            3 -> "апр."
-                            4 -> "мая"
-                            5 -> "июня"
-                            6 -> "июля"
-                            7 -> "авг."
-                            8 -> "сент."
-                            9 -> "окт."
-                            10 -> "нояб."
-                            11 -> "дек."
-                            else -> ""
-                        }
-                        "$ruDay, $day $ruMonth"
-                    }
-                    "fr" -> {
-                        val frDay = when (dayOfWeek) {
-                            Calendar.SUNDAY -> "Dim"
-                            Calendar.MONDAY -> "Lun"
-                            Calendar.TUESDAY -> "Mar"
-                            Calendar.WEDNESDAY -> "Mer"
-                            Calendar.THURSDAY -> "Jeu"
-                            Calendar.FRIDAY -> "Ven"
-                            Calendar.SATURDAY -> "Sam"
-                            else -> ""
-                        }
-                        val frMonth = when (month) {
-                            0 -> "janv."
-                            1 -> "févr."
-                            2 -> "mars"
-                            3 -> "avr."
-                            4 -> "mai"
-                            5 -> "juin"
-                            6 -> "juil."
-                            7 -> "août"
-                            8 -> "sept."
-                            9 -> "oct."
-                            10 -> "nov."
-                            11 -> "déc."
-                            else -> ""
-                        }
-                        "$frDay, $day $frMonth"
-                    }
-                    else -> {
-                        val enDay = when (dayOfWeek) {
-                            Calendar.SUNDAY -> "Sun"
-                            Calendar.MONDAY -> "Mon"
-                            Calendar.TUESDAY -> "Tue"
-                            Calendar.WEDNESDAY -> "Wed"
-                            Calendar.THURSDAY -> "Thu"
-                            Calendar.FRIDAY -> "Fri"
-                            Calendar.SATURDAY -> "Sat"
-                            else -> ""
-                        }
-                        val enMonth = when (month) {
-                            0 -> "Jan"
-                            1 -> "Feb"
-                            2 -> "Mar"
-                            3 -> "Apr"
-                            4 -> "May"
-                            5 -> "Jun"
-                            6 -> "Jul"
-                            7 -> "Aug"
-                            8 -> "Sep"
-                            9 -> "Oct"
-                            10 -> "Nov"
-                            11 -> "Dec"
-                            else -> ""
-                        }
-                        "$enDay, $enMonth $day"
-                    }
+                    else -> "$day/$month/$year"
                 }
             }
             dateStr
@@ -259,26 +183,9 @@ object WeatherManager {
 
     private fun getWeatherDescriptionAndIcon(code: Int, lang: String): Pair<String, String> {
         return when (code) {
-            0 -> Pair(
-                when (lang) { "he" -> "בהיר"; "ru" -> "Ясно"; "fr" -> "Ensoleillé"; else -> "Sunny" },
-                "☀️"
-            )
-            1, 2, 3 -> Pair(
-                when (lang) { "he" -> "מעונן חלקי"; "ru" -> "Переменная облачность"; "fr" -> "Partiellement nuageux"; else -> "Partly Cloudy" },
-                "⛅"
-            )
-            45, 48 -> Pair(
-                when (lang) { "he" -> "ערפל"; "ru" -> "Туман"; "fr" -> "Brouillard"; else -> "Foggy" },
-                "🌫️"
-            )
-            51, 53, 55, 61, 63, 65 -> Pair(
-                when (lang) { "he" -> "גשום"; "ru" -> "Дождь"; "fr" -> "Pluvieux"; else -> "Rainy" },
-                "🌧️"
-            )
-            else -> Pair(
-                when (lang) { "he" -> "נאה"; "ru" -> "Хорошо"; "fr" -> "Clair"; else -> "Clear" },
-                "🌤️"
-            )
+            0 -> Pair(when (lang) { "he" -> "בהיר"; else -> "Sunny" }, "☀️")
+            1, 2, 3 -> Pair(when (lang) { "he" -> "מעונן חלקי"; else -> "Partly Cloudy" }, "⛅")
+            else -> Pair(when (lang) { "he" -> "נאה"; else -> "Clear" }, "🌤️")
         }
     }
 }

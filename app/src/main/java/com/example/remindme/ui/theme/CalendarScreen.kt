@@ -219,10 +219,9 @@ fun CalendarScreen(onNavigateBack: () -> Unit) {
             currentLang = LanguageManager.getSelectedLanguage(context),
             initialDate = selectedDate,
             onDismiss = { showAddDialog = false },
-            onAdd = { title: String, time: String, date: String, isRepeating: Boolean, repeatType: String, soundUri: String? ->
+            onAdd = { title: String, time: String, date: String, isRepeating: Boolean, repeatType: String, soundUri: String?, advanceMinutes: Int, ringSeconds: Int ->
                 val newId = (reminders.maxOfOrNull { it.id } ?: 0) + 1
-                val newReminder = ReminderItem(
-                    id = newId,
+                val newReminder = ReminderItem(                    id = newId,
                     title = title,
                     time = time,
                     date = date,

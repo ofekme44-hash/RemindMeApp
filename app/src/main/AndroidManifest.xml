@@ -10,7 +10,12 @@
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- נדרש כדי ששירות הצליל יוכל לרוץ ולנגן (אנדרואיד 9 ומעלה / 14 ומעלה) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <application
         android:allowBackup="true"
@@ -51,6 +56,12 @@
             android:turnScreenOn="true"
             android:exported="false" />
 
+        <!-- פעולות מתוך ההתראה (התקשר / פתח שיר) -->
+        <activity
+            android:name=".utils.AlarmActionActivity"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:exported="false" />
+
         <!-- שירות ניגון ההתרעות ברקע -->
         <service
             android:name=".utils.AlarmService"
@@ -61,6 +72,16 @@
         <receiver
             android:name=".utils.ReminderReceiver"
             android:exported="true" />
+
+        <!-- קובע מחדש את כל ההתראות אחרי הפעלה מחדש של הטלפון או עדכון האפליקציה -->
+        <receiver
+            android:name=".utils.ReminderBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".receivers.RemindMeWidgetProvider"

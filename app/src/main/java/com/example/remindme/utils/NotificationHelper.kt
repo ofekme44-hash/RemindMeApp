@@ -3,7 +3,6 @@ package com.example.remindme.utils
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.ActivityManager
 import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -24,6 +23,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
@@ -44,14 +44,24 @@ private fun cleanPhone(phone: String?): String =
 
 class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val title = intent.getStringExtra("title") ?: getLocalizedDefaultTitle(context)
+        val isEarly = intent.getBooleanExtra("isEarly", false)
+        val advanceMinutes = intent.getIntExtra("advanceMinutes", 0)
+        val ringSeconds = intent.getIntExtra("ringSeconds", 0)
+        val baseTitle = intent.getStringExtra("title") ?: getLocalizedDefaultTitle(context)
+        val title = if (isEarly) NotificationHelper.earlyTitle(context, advanceMinutes, baseTitle) else baseTitle
         val soundUri = intent.getStringExtra("soundUri")
         val phone = intent.getStringExtra("phone")
 
         val fullScreenIntent = NotificationHelper.alarmActivityIntent(context, title, soundUri, phone)
 
+        // Turn the screen on, so the alert is visible even when the phone is off/locked
         try {
-            context.startActivity(fullScreenIntent)
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            @Suppress("DEPRECATION")
+            pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+                "RemindMe:alarmWake"
+            ).acquire(15_000L)
         } catch (_: Exception) {
         }
 
@@ -62,6 +72,7 @@ class ReminderReceiver : BroadcastReceiver() {
                     putExtra("title", title)
                     putExtra("soundUri", soundUri)
                     putExtra("phone", phone)
+                    putExtra("ringSeconds", ringSeconds)
                 }
             )
             true
@@ -73,22 +84,39 @@ class ReminderReceiver : BroadcastReceiver() {
             NotificationHelper.showNotification(context, title, fullScreenIntent, phone, soundUri)
         }
 
+        try {
+            context.startActivity(fullScreenIntent)
+        } catch (_: Exception) {
+        }
+
         val repeatType = intent.getStringExtra("repeatType") ?: "NONE"
         val id = intent.getIntExtra("id", -1)
         val date = intent.getStringExtra("date")
         val time = intent.getStringExtra("time")
         if (repeatType != "NONE" && id != -1 && date != null && time != null) {
-            NotificationHelper.schedule(
-                context = context,
-                id = id,
-                title = title,
-                dateStr = date,
-                timeStr = time,
-                soundUri = soundUri,
-                repeatType = repeatType,
-                phone = phone.orEmpty(),
-                afterMillis = System.currentTimeMillis() + 1000
-            )
+            val next = System.currentTimeMillis() + 1000
+            if (isEarly) {
+                // Only re-arm the early alarm for the next cycle; the main alarm is already set
+                NotificationHelper.scheduleEarly(
+                    context = context, id = id, title = baseTitle, dateStr = date, timeStr = time,
+                    soundUri = soundUri, repeatType = repeatType, phone = phone.orEmpty(),
+                    advanceMinutes = advanceMinutes, ringSeconds = ringSeconds, afterMillis = next
+                )
+            } else {
+                NotificationHelper.schedule(
+                    context = context,
+                    id = id,
+                    title = baseTitle,
+                    dateStr = date,
+                    timeStr = time,
+                    soundUri = soundUri,
+                    repeatType = repeatType,
+                    phone = phone.orEmpty(),
+                    advanceMinutes = advanceMinutes,
+                    ringSeconds = ringSeconds,
+                    afterMillis = next
+                )
+            }
         }
     }
 
@@ -131,6 +159,7 @@ class AlarmService : Service() {
         val title = intent?.getStringExtra("title").orEmpty()
         val soundUri = intent?.getStringExtra("soundUri")
         val phone = intent?.getStringExtra("phone")
+        val ringSeconds = intent?.getIntExtra("ringSeconds", 0) ?: 0
 
         handler.removeCallbacksAndMessages(null)
         releasePlayer()
@@ -163,24 +192,30 @@ class AlarmService : Service() {
             return START_NOT_STICKY
         }
 
+        // A foreground service started by the alarm may also open the alert screen
+        try {
+            startActivity(fullScreenIntent)
+        } catch (_: Exception) {
+        }
+
         handler.postDelayed({
-            if (isAppInForeground()) {
-                finishRinging()
-            } else {
-                startSound(soundUri)
-                val seconds = ReminderStorage.getRingDurationSec(this).coerceAtLeast(10)
+            val seconds = (if (ringSeconds > 0) ringSeconds else ReminderStorage.getRingDurationSec(this)).coerceAtLeast(5)
+            // A chosen song plays once, from start to end. The default alarm sound
+            // (short) repeats for the default ring duration instead.
+            val songPlaying = startSound(soundUri)
+            deadlineAt = if (songPlaying) 0L else System.currentTimeMillis() + seconds * 1000L
+            if (player == null) {
                 handler.postDelayed({ finishRinging() }, seconds * 1000L)
+            } else {
+                // Safety net only (very long tracks)
+                handler.postDelayed({ finishRinging() }, 30 * 60_000L)
             }
-        }, 1500L)
+        }, 300L)
 
         return START_NOT_STICKY
     }
 
-    private fun isAppInForeground(): Boolean {
-        val info = ActivityManager.RunningAppProcessInfo()
-        ActivityManager.getMyMemoryState(info)
-        return info.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
-    }
+    private var deadlineAt = 0L
 
     private fun finishRinging() {
         releasePlayer()
@@ -193,11 +228,13 @@ class AlarmService : Service() {
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
 
-    private fun startSound(soundUri: String?) {
-        val custom: Uri? = if (!soundUri.isNullOrBlank() && !soundUri.startsWith("http")) soundUri.toUri() else null
-        if (custom == null || !playUri(custom)) {
-            playUri(defaultAlarmUri())
-        }
+    private fun startSound(soundUri: String?): Boolean {
+        // Web links can't be played directly, so only phone sounds and songs are used here
+        val isLink = !soundUri.isNullOrBlank() && soundUri.startsWith("http")
+        val custom: Uri? = if (!soundUri.isNullOrBlank() && !isLink) soundUri.toUri() else null
+        if (custom != null && playUri(custom)) return true
+        playUri(defaultAlarmUri())
+        return false
     }
 
     private fun playUri(uri: Uri?): Boolean {
@@ -211,8 +248,23 @@ class AlarmService : Service() {
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
+            mp.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
             mp.setDataSource(this, uri)
-            mp.isLooping = true
+            mp.isLooping = false
+            // Replay the whole track from the start until the chosen time is reached;
+            // a track is never cut in the middle - the last one plays to its end.
+            mp.setOnCompletionListener { m ->
+                if (System.currentTimeMillis() < deadlineAt) {
+                    try {
+                        m.seekTo(0)
+                        m.start()
+                    } catch (_: Exception) {
+                        finishRinging()
+                    }
+                } else {
+                    finishRinging()
+                }
+            }
             mp.prepare()
             mp.start()
             player = mp
@@ -332,6 +384,7 @@ object NotificationHelper {
     private const val CHANNEL_ID = "remind_me_channel_v2"
     const val ALARM_CHANNEL_ID = "remind_me_alarm_silent_v1"
     private const val DAY_MS = 24L * 60L * 60L * 1000L
+    private const val EARLY_OFFSET = 1_000_000
 
     fun createNotificationChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -347,7 +400,13 @@ object NotificationHelper {
                 channelName,
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "התראות מיוחדות עבור תזכורות בזמן אמת"
+                description = pick(
+                    LanguageManager.getSelectedLanguage(context),
+                    "התראות מיוחדות עבור תזכורות בזמן אמת",
+                    "Special alerts for real-time reminders",
+                    "Специальные уведомления для напоминаний",
+                    "Alertes spéciales pour les rappels en temps réel"
+                )
                 enableVibration(true)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
@@ -419,6 +478,7 @@ object NotificationHelper {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(openIntent)
             .setFullScreenIntent(openIntent, true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setAutoCancel(true)
 
         if (withStopAction) {
@@ -510,7 +570,12 @@ object NotificationHelper {
             "WEEKLY" -> Calendar.DAY_OF_YEAR to 7
             "MONTHLY" -> Calendar.MONTH to 1
             "YEARLY" -> Calendar.YEAR to 1
-            else -> return if (base.time > afterMillis) base.time else null
+            else -> return when {
+                base.time > afterMillis -> base.time
+                // Chosen "right now" (same minute): ring in a couple of seconds
+                afterMillis - base.time < 60_000L -> afterMillis + 2_000L
+                else -> null
+            }
         }
 
         var k = when (repeatType) {
@@ -531,6 +596,23 @@ object NotificationHelper {
         return null
     }
 
+    private fun setAlarm(context: Context, triggerAt: Long, pendingIntent: PendingIntent) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val canExact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()
+        if (canExact) {
+            val showIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)?.let {
+                PendingIntent.getActivity(context, 0, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            }
+            if (showIntent != null) {
+                alarmManager.setAlarmClock(AlarmManager.AlarmClockInfo(triggerAt, showIntent), pendingIntent)
+            } else {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+            }
+        } else {
+            alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+        }
+    }
+
     fun schedule(
         context: Context,
         id: Int,
@@ -540,6 +622,8 @@ object NotificationHelper {
         soundUri: String? = null,
         repeatType: String = "NONE",
         phone: String = "",
+        advanceMinutes: Int = 0,
+        ringSeconds: Int = 0,
         afterMillis: Long = System.currentTimeMillis()
     ) {
         try {
@@ -557,33 +641,83 @@ object NotificationHelper {
                 putExtra("time", timeStr)
                 putExtra("repeatType", repeatType)
                 putExtra("phone", phone)
+                putExtra("advanceMinutes", advanceMinutes)
+                putExtra("ringSeconds", ringSeconds)
             }
 
             val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                id,
-                intent,
+                context, id, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
+            setAlarm(context, triggerAt, pendingIntent)
 
-            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val canExact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()
+            scheduleEarly(context, id, title, dateStr, timeStr, soundUri, repeatType, phone, advanceMinutes, ringSeconds, afterMillis)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
 
-            if (canExact) {
-                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
-            } else {
-                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+    /** Arms the "X before" alarm for the first occurrence whose early time is still in the future. */
+    fun scheduleEarly(
+        context: Context,
+        id: Int,
+        title: String,
+        dateStr: String,
+        timeStr: String,
+        soundUri: String?,
+        repeatType: String,
+        phone: String,
+        advanceMinutes: Int,
+        ringSeconds: Int = 0,
+        afterMillis: Long = System.currentTimeMillis()
+    ) {
+        try {
+            if (advanceMinutes <= 0) {
+                cancelCode(context, id + EARLY_OFFSET)
+                return
             }
+            val advanceMs = advanceMinutes * 60_000L
+            val occurrence = nextTriggerMillis(dateStr, timeStr, repeatType, afterMillis + advanceMs)
+            val baseTime = try { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).parse("$dateStr $timeStr")?.time } catch (_: Exception) { null }
+            val earlyAlreadyPassed = repeatType == "NONE" && baseTime != null && baseTime <= afterMillis + advanceMs
+            if (occurrence == null || earlyAlreadyPassed) {
+                cancelCode(context, id + EARLY_OFFSET)
+                return
+            }
+
+            val intent = Intent(context, ReminderReceiver::class.java).apply {
+                putExtra("id", id)
+                putExtra("title", title)
+                putExtra("soundUri", soundUri)
+                putExtra("date", dateStr)
+                putExtra("time", timeStr)
+                putExtra("repeatType", repeatType)
+                putExtra("phone", phone)
+                putExtra("advanceMinutes", advanceMinutes)
+                putExtra("ringSeconds", ringSeconds)
+                putExtra("isEarly", true)
+            }
+
+            val pendingIntent = PendingIntent.getBroadcast(
+                context, id + EARLY_OFFSET, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            setAlarm(context, occurrence - advanceMs, pendingIntent)
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
     fun cancelReminder(context: Context, id: Int) {
+        cancelCode(context, id)
+        cancelCode(context, id + EARLY_OFFSET)
+    }
+
+    private fun cancelCode(context: Context, requestCode: Int) {
         try {
             val existing = PendingIntent.getBroadcast(
                 context,
-                id,
+                requestCode,
                 Intent(context, ReminderReceiver::class.java),
                 PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
             )
@@ -595,6 +729,20 @@ object NotificationHelper {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    fun earlyTitle(context: Context, minutes: Int, title: String): String {
+        val lang = LanguageManager.getSelectedLanguage(context)
+        val amount = when (minutes) {
+            5 -> pick(lang, "5 דקות", "5 minutes", "5 минут", "5 minutes")
+            15 -> pick(lang, "15 דקות", "15 minutes", "15 минут", "15 minutes")
+            30 -> pick(lang, "30 דקות", "30 minutes", "30 минут", "30 minutes")
+            60 -> pick(lang, "שעה", "1 hour", "1 час", "1 heure")
+            120 -> pick(lang, "שעתיים", "2 hours", "2 часа", "2 heures")
+            1440 -> pick(lang, "יום", "1 day", "1 день", "1 jour")
+            else -> pick(lang, "$minutes דקות", "$minutes minutes", "$minutes минут", "$minutes minutes")
+        }
+        return pick(lang, "בעוד $amount: $title", "In $amount: $title", "Через $amount: $title", "Dans $amount : $title")
     }
 
     @Deprecated("Use schedule() with the reminder id")

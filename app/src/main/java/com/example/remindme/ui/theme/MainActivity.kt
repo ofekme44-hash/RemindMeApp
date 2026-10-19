@@ -11,6 +11,7 @@ import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -24,6 +25,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,19 +37,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import com.example.remindme.utils.AlarmService
+import com.example.remindme.utils.CloudSync
 import com.example.remindme.utils.LanguageManager
 import com.example.remindme.utils.ReminderStorage
 import com.example.remindme.utils.ShareUtils
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -55,7 +62,9 @@ import java.util.*
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -97,14 +106,13 @@ data class ReminderItem(
     val isEnabled: Boolean = true,
     val isDaily: Boolean = false,
     val repeatType: String = "NONE",
-    val soundUri: String? = null
+    val soundUri: String? = null,
+    val advanceMinutes: Int = 0,   // 0 = no early alert
+    val ringSeconds: Int = 0       // 0 = use the general setting
 )
 
 data class DayForecast(val date: String, val max: Int, val min: Int, val code: Int)
-data class WeatherState(val currentTemp: Int, val currentCode: Int, val daily: List<DayForecast>)
-
-// ───────────────────────────── Helpers ─────────────────────────────
-
+data class WeatherState(val currentTemp: Int, val currentCode: Int, val daily: List<DayForecast>, val currentTime: String = "", val cityName: String = "")
 private fun tr(lang: String, he: String, en: String, ru: String = en, fr: String = en): String =
     when (lang) {
         "he" -> he
@@ -126,6 +134,8 @@ private fun parseDateTime(date: String, time: String): Date? = try {
     null
 }
 
+fun ReminderItem.isPassed(): Boolean = isExpired()
+
 private fun ReminderItem.isExpired(): Boolean {
     if (isDaily || repeatType != "NONE") return false
     val dateTime = parseDateTime(date, time) ?: return false
@@ -142,7 +152,9 @@ private fun createReminder(
     date: String,
     isRepeating: Boolean,
     repeatType: String,
-    soundUri: String?
+    soundUri: String?,
+    advanceMinutes: Int,
+    ringSeconds: Int
 ) = ReminderItem(
     id = (existing.maxOfOrNull { it.id } ?: 0) + 1,
     title = title,
@@ -150,7 +162,31 @@ private fun createReminder(
     date = date,
     isDaily = isRepeating && repeatType == "DAILY",
     repeatType = if (isRepeating) repeatType else "NONE",
-    soundUri = soundUri
+    soundUri = soundUri,
+    advanceMinutes = advanceMinutes,
+    ringSeconds = ringSeconds
+)
+
+/** Applies the edited values to an existing reminder, keeping its id and enabled state. */
+private fun editedReminder(
+    old: ReminderItem,
+    title: String,
+    time: String,
+    date: String,
+    isRepeating: Boolean,
+    repeatType: String,
+    soundUri: String?,
+    advanceMinutes: Int,
+    ringSeconds: Int
+) = old.copy(
+    title = title,
+    time = time,
+    date = date,
+    isDaily = isRepeating && repeatType == "DAILY",
+    repeatType = if (isRepeating) repeatType else "NONE",
+    soundUri = soundUri,
+    advanceMinutes = advanceMinutes,
+    ringSeconds = ringSeconds
 )
 
 private fun repeatUnitLabel(lang: String, type: String): String = when (type) {
@@ -169,8 +205,50 @@ private fun repeatBadge(lang: String, type: String): String? = when (type) {
     else -> null
 }
 
-private fun youtubeSearchUrl(query: String) =
-    "https://www.youtube.com/results?search_query=${Uri.encode(query)}"
+private val advanceOptions = listOf(0, 5, 15, 30, 60, 120, 1440)
+
+private val ringOptions = listOf(15, 30, 60, 120, 300, 600, 900, 1800)
+
+private fun ringLabel(lang: String, seconds: Int): String = when (seconds) {
+    15 -> tr(lang, "15 שנ'", "15 sec", "15 сек", "15 s")
+    30 -> tr(lang, "30 שנ'", "30 sec", "30 сек", "30 s")
+    60 -> tr(lang, "דקה", "1 min", "1 мин", "1 min")
+    120 -> tr(lang, "2 דק'", "2 min", "2 мин", "2 min")
+    300 -> tr(lang, "5 דק'", "5 min", "5 мин", "5 min")
+    600 -> tr(lang, "10 דק'", "10 min", "10 мин", "10 min")
+    900 -> tr(lang, "15 דק'", "15 min", "15 мин", "15 min")
+    1800 -> tr(lang, "30 דק'", "30 min", "30 мин", "30 min")
+    else -> "$seconds s"
+}
+
+private fun advanceLabel(lang: String, minutes: Int): String = when (minutes) {
+    0 -> tr(lang, "ללא", "None", "Нет", "Aucun")
+    5 -> tr(lang, "5 דק'", "5 min", "5 мин", "5 min")
+    15 -> tr(lang, "15 דק'", "15 min", "15 мин", "15 min")
+    30 -> tr(lang, "30 דק'", "30 min", "30 мин", "30 min")
+    60 -> tr(lang, "שעה", "1 hour", "1 час", "1 heure")
+    120 -> tr(lang, "שעתיים", "2 hours", "2 часа", "2 heures")
+    1440 -> tr(lang, "יום", "1 day", "1 день", "1 jour")
+    else -> "$minutes"
+}
+
+private fun advanceBadge(lang: String, minutes: Int): String? =
+    if (minutes <= 0) null
+    else tr(
+        lang,
+        "התראה ${advanceLabel(lang, minutes)} לפני",
+        "Alert ${advanceLabel(lang, minutes)} before",
+        "Уведомление за ${advanceLabel(lang, minutes)}",
+        "Alerte ${advanceLabel(lang, minutes)} avant"
+    )
+
+private fun uriDisplayName(context: Context, uri: Uri): String? = try {
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) cursor.getString(0) else null
+    }
+} catch (_: Exception) {
+    null
+}
 
 @Suppress("DEPRECATION")
 private fun Intent.pickedRingtoneUri(): Uri? =
@@ -211,12 +289,38 @@ private fun weatherEmoji(code: Int): String = when (code) {
 
 // ───────────────────────────── Network ─────────────────────────────
 
-private suspend fun fetchWeather(): WeatherState? = withContext(Dispatchers.IO) {
+private suspend fun fetchWeather(currentLang: String): WeatherState? = withContext(Dispatchers.IO) {
     try {
-        val url = "https://api.open-meteo.com/v1/forecast?latitude=$WEATHER_LAT&longitude=$WEATHER_LON" +
+        val ipResponse = URL("https://ipwho.is/").readText()
+        val ipJson = JSONObject(ipResponse)
+        val latitude = ipJson.optDouble("latitude", WEATHER_LAT)
+        val longitude = ipJson.optDouble("longitude", WEATHER_LON)
+        val timezoneId = ipJson.optJSONObject("timezone")?.optString("id", "Asia/Jerusalem")
+            ?: ipJson.optString("timezone", "Asia/Jerusalem")
+
+        val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+            timeZone = TimeZone.getTimeZone(timezoneId)
+        }
+        val exactLocalTime = timeFormat.format(Date())
+
+        val city = ipJson.optString("city", "")
+        val country = ipJson.optString("country", "")
+
+        val formattedLocation = if (city.isNotBlank() && country.isNotBlank()) {
+            if (currentLang == "he") {
+                "$country, $city"
+            } else {
+                "$city, $country"
+            }
+        } else {
+            if (currentLang == "he") "ישראל, ירושלים" else "Jerusalem, Israel"
+        }
+
+        val url = "https://api.open-meteo.com/v1/forecast?latitude=$latitude&longitude=$longitude" +
                 "&current=temperature_2m,weather_code" +
                 "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
-                "&timezone=auto&forecast_days=7"
+                "&timezone=$timezoneId&forecast_days=7"
+
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 5000
         connection.readTimeout = 5000
@@ -225,6 +329,7 @@ private suspend fun fetchWeather(): WeatherState? = withContext(Dispatchers.IO) 
         } finally {
             connection.disconnect()
         }
+
         val json = JSONObject(body)
         val current = json.getJSONObject("current")
         val daily = json.getJSONObject("daily")
@@ -232,6 +337,7 @@ private suspend fun fetchWeather(): WeatherState? = withContext(Dispatchers.IO) 
         val codes = daily.getJSONArray("weather_code")
         val maxes = daily.getJSONArray("temperature_2m_max")
         val mins = daily.getJSONArray("temperature_2m_min")
+
         val days = (0 until dates.length()).map { i ->
             DayForecast(
                 date = dates.getString(i),
@@ -240,41 +346,67 @@ private suspend fun fetchWeather(): WeatherState? = withContext(Dispatchers.IO) 
                 code = codes.getInt(i)
             )
         }
+
         WeatherState(
             currentTemp = current.getDouble("temperature_2m").roundToInt(),
             currentCode = current.getInt("weather_code"),
-            daily = days
+            daily = days,
+            currentTime = exactLocalTime,
+            cityName = formattedLocation
         )
     } catch (_: Exception) {
         null
     }
 }
+data class SongResult(val title: String, val artist: String, val previewUrl: String)
 
-private suspend fun fetchSongSuggestions(query: String): List<Pair<String, String>> =
-    withContext(Dispatchers.IO) {
-        val fallback = listOf(query to youtubeSearchUrl(query))
-        try {
-            val url = "https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q=${Uri.encode(query)}"
+/** Searches songs by name (iTunes catalog). Each result has a 30-second preview. Returns null when offline. */
+private suspend fun searchSongs(query: String): List<SongResult>? = withContext(Dispatchers.IO) {
+    try {
+        val url = "https://itunes.apple.com/search?media=music&entity=song&limit=10&term=${Uri.encode(query)}"
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 5000
+        connection.readTimeout = 5000
+        val body = try {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+        val results = JSONObject(body).getJSONArray("results")
+        val list = mutableListOf<SongResult>()
+        for (i in 0 until results.length()) {
+            val item = results.getJSONObject(i)
+            val preview = item.optString("previewUrl", "")
+            if (preview.isNotBlank()) {
+                list.add(SongResult(item.optString("trackName"), item.optString("artistName"), preview))
+            }
+        }
+        list
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** Saves the preview inside the app so the alarm can play it later without internet. Returns the file uri. */
+private suspend fun downloadPreview(context: Context, url: String): String? = withContext(Dispatchers.IO) {
+    try {
+        val dir = File(context.filesDir, "songs").apply { mkdirs() }
+        val file = File(dir, "song_${url.hashCode()}.m4a")
+        if (!file.exists() || file.length() == 0L) {
             val connection = URL(url).openConnection() as HttpURLConnection
-            connection.connectTimeout = 4000
-            connection.readTimeout = 4000
-            val response = try {
-                connection.inputStream.bufferedReader().use { it.readText() }
+            connection.connectTimeout = 8000
+            connection.readTimeout = 15000
+            try {
+                connection.inputStream.use { input -> file.outputStream().use { input.copyTo(it) } }
             } finally {
                 connection.disconnect()
             }
-            val jsonArray = JSONArray(response.substring(response.indexOf("["), response.lastIndexOf("]") + 1))
-            val items = jsonArray.getJSONArray(1)
-            val result = mutableListOf<Pair<String, String>>()
-            for (i in 0 until minOf(items.length(), 5)) {
-                val term = items.getJSONArray(i).getString(0)
-                result.add(term to youtubeSearchUrl(term))
-            }
-            if (result.isEmpty()) fallback else result
-        } catch (_: Exception) {
-            fallback
         }
+        if (file.length() > 0L) Uri.fromFile(file).toString() else null
+    } catch (_: Exception) {
+        null
     }
+}
 
 // ───────────────────────────── Activity ─────────────────────────────
 
@@ -287,13 +419,26 @@ class MainActivity : ComponentActivity() {
 
         val data: Uri? = intent?.data
         val isSharedInvite = data != null && data.scheme == "https" && data.host == "remindme.local"
-        val senderName = data?.getQueryParameter("sender") ?: "משתמש"
+        val senderName = data?.getQueryParameter("sender")
+            ?: tr(LanguageManager.getSelectedLanguage(this), "משתמש", "User", "Пользователь", "Utilisateur")
         val permission = data?.getQueryParameter("permission") ?: "read"
         setContent {
             var isDarkMode by remember { mutableStateOf(ReminderStorage.isDarkMode(this@MainActivity)) }
             var showShareDialog by remember { mutableStateOf(isSharedInvite) }
             var isFirstLaunch by remember { mutableStateOf(LanguageManager.isFirstLaunch(this@MainActivity)) }
             var currentLang by remember { mutableStateOf(LanguageManager.getSelectedLanguage(this@MainActivity)) }
+            var showCalendarScreen by remember { mutableStateOf(false) }
+            var isSignedIn by remember { mutableStateOf(CloudSync.isSignedIn()) }
+            // Already signed in from before: refresh from the account first (a few seconds at most)
+            var isSyncReady by remember { mutableStateOf(!CloudSync.isSignedIn()) }
+            val activityScope = rememberCoroutineScope()
+
+            LaunchedEffect(isSignedIn) {
+                if (isSignedIn && !isSyncReady) {
+                    withTimeoutOrNull(5000) { CloudSync.pull(this@MainActivity) }
+                    isSyncReady = true
+                }
+            }
 
             RemindMeTheme(darkTheme = isDarkMode) {
                 val direction = if (currentLang == "he") LayoutDirection.Rtl else LayoutDirection.Ltr
@@ -309,8 +454,29 @@ class MainActivity : ComponentActivity() {
                                 isFirstLaunch = false
                             }
                         )
+                    } else if (!isSignedIn) {
+                        LoginScreen(
+                            onSignedIn = {
+                                isSyncReady = true
+                                isSignedIn = true
+                            }
+                        )
+                    } else if (!isSyncReady) {
+                        Box(
+                            modifier = Modifier.fillMaxSize().background(DarkBackground),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(color = GoldAccent)
+                        }
                     } else {
-                        MainAppScreen(
+                        MainScreenContent(
+                            onLogout = {
+                                activityScope.launch {
+                                    CloudSync.signOutAndClear(this@MainActivity)
+                                    isSyncReady = false
+                                    isSignedIn = false
+                                }
+                            },
                             isDarkMode = isDarkMode,
                             currentLang = currentLang,
                             onToggleDarkMode = {
@@ -318,7 +484,10 @@ class MainActivity : ComponentActivity() {
                                 isDarkMode = newValue
                                 ReminderStorage.saveDarkMode(this@MainActivity, newValue)
                             },
-                            onLanguageChanged = { newLang ->
+                            onOpenCalendar = {
+                                // אם יש לך מסך קלנדר, ודא שהקריאה תואמת, או השאר את מה שהיה אצלך
+                            },
+                            onLanguageChanged = { newLang: String ->
                                 LanguageManager.saveLanguage(this@MainActivity, newLang)
                                 currentLang = newLang
                             }
@@ -345,12 +514,12 @@ class MainActivity : ComponentActivity() {
                             text = {
                                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(
-                                        text = "$senderName מבקש לשתף איתך את היומן שלו.",
+                                        text = tr(currentLang, "$senderName מבקש לשתף איתך את היומן שלו.", "$senderName wants to share their calendar with you.", "$senderName хочет поделиться с вами своим календарём.", "$senderName souhaite partager son calendrier avec vous."),
                                         color = TextPrimaryDark,
                                         fontSize = 15.sp
                                     )
                                     Text(
-                                        text = "סוג הרשאה מבוקש: $permissionText",
+                                        text = tr(currentLang, "סוג הרשאה מבוקש: $permissionText", "Requested permission: $permissionText", "Запрошенное разрешение: $permissionText", "Autorisation demandée : $permissionText"),
                                         color = GoldAccent,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 14.sp
@@ -502,175 +671,195 @@ fun WelcomeLanguageScreen(
 }
 
 @Composable
-fun MainAppScreen(
-    isDarkMode: Boolean,
-    currentLang: String,
-    onToggleDarkMode: () -> Unit,
-    onLanguageChanged: (String) -> Unit
-) {
-    var currentScreen by rememberSaveable { mutableStateOf("MAIN") }
-
-    BackHandler(enabled = currentScreen == "CALENDAR") { currentScreen = "MAIN" }
-
-    PermissionCheckDialog(isDarkMode = isDarkMode, currentLang = currentLang)
-
-    if (currentScreen == "CALENDAR") {
-        RemindMeCalendarScreen(
-            currentLang = currentLang,
-            onNavigateBack = { currentScreen = "MAIN" },
-            isDarkMode = isDarkMode
-        )
-    } else {
-        MainScreenContent(
-            isDarkMode = isDarkMode,
-            currentLang = currentLang,
-            onToggleDarkMode = onToggleDarkMode,
-            onOpenCalendar = { currentScreen = "CALENDAR" },
-            onLanguageChanged = onLanguageChanged
-        )
-    }
-}
-
-@Composable
 fun MainScreenContent(
     isDarkMode: Boolean,
     currentLang: String,
     onToggleDarkMode: () -> Unit,
     onOpenCalendar: () -> Unit,
-    onLanguageChanged: (String) -> Unit
+    onLanguageChanged: (String) -> Unit,
+    onLogout: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val (backgroundColor, surfaceColor, textPrimary, textSecondary) = appColors(isDarkMode)
 
+    var showCalendarScreen by remember { mutableStateOf(false) }
+
     var reminders by remember {
-        mutableStateOf(ReminderStorage.loadReminders(context).filterNot { it.isExpired() })
+        mutableStateOf(ReminderStorage.loadReminders(context))
     }
 
     LaunchedEffect(reminders) {
         ReminderStorage.saveReminders(context, reminders)
     }
 
+    // שומרים את מזג האוויר ואת השעה החיה שמתעדכנת ברקע
     var weather by remember { mutableStateOf<WeatherState?>(null) }
-    LaunchedEffect(Unit) { weather = fetchWeather() }
+    var liveLocalTime by remember { mutableStateOf("") }
+
+// טעינת מזג האוויר והשעה הראשונית לפי השפה הנבחרת
+    LaunchedEffect(key1 = currentLang) {
+        val fetchedWeather = fetchWeather(currentLang)
+        weather = fetchedWeather
+        liveLocalTime = fetchedWeather?.currentTime ?: ""
+    }
+
+    // לולאה שרצה ברקע ומעדכנת את השעה אוטומטית כל דקה בדיוק
+    LaunchedEffect(weather) {
+        while (true) {
+            val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+                timeZone = TimeZone.getTimeZone("Asia/Jerusalem")
+            }
+            liveLocalTime = timeFormat.format(Date())
+            delay(60000L) // עדכון אוטומטי כל 60 שניות
+        }
+    }
 
     var showAddDialog by remember { mutableStateOf(false) }
+    var reminderToEdit by remember { mutableStateOf<ReminderItem?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showWeatherWeeklyDialog by remember { mutableStateOf(false) }
     var reminderToDelete by remember { mutableStateOf<ReminderItem?>(null) }
 
-    val appTitle = remember(currentLang) { LanguageManager.getString(context, "app_title") }
     val myRemindersText = remember(currentLang) { LanguageManager.getString(context, "my_reminders") }
     val sortedReminders = remember(reminders) { reminders.sortedByTime() }
 
-    Scaffold(
-        containerColor = backgroundColor,
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showAddDialog = true },
-                containerColor = GoldAccent,
-                contentColor = DarkBackground,
-                shape = RoundedCornerShape(22.dp)
+    if (showCalendarScreen) {
+        RemindMeCalendarScreen(
+            currentLang = currentLang,
+            onNavigateBack = { showCalendarScreen = false },
+            isDarkMode = isDarkMode
+        )
+    } else {
+        Scaffold(
+            containerColor = backgroundColor,
+            floatingActionButton = {
+                FloatingActionButton(
+                    onClick = { showAddDialog = true },
+                    containerColor = GoldAccent,
+                    contentColor = DarkBackground,
+                    shape = RoundedCornerShape(22.dp)
+                ) {
+                    Text("+", fontSize = 32.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        ) { innerPadding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .padding(horizontal = 20.dp)
             ) {
-                Text("+", fontSize = 32.sp, fontWeight = FontWeight.Bold)
-            }
-        }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(horizontal = 20.dp)
-        ) {
-            Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
-            Text(
-                text = appTitle,
-                color = GoldAccent,
-                fontSize = 34.sp,
-                fontWeight = FontWeight.ExtraBold,
-                letterSpacing = 1.2.sp
-            )
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = onToggleDarkMode,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(surfaceColor)
-                        .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                // ── חלק עליון: כותרת RemindMe בצהוב ומתחתיה השעה החיה שמתעדכנת לבד ──
+                Column(
+                    horizontalAlignment = Alignment.Start,
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(if (isDarkMode) "☀️" else "🌙", fontSize = 20.sp)
-                }
+                    Text(
+                        text = "RemindMe",
+                        color = Color(0xFFFFD700),
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 1.2.sp
+                    )
 
-                IconButton(
-                    onClick = onOpenCalendar,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(surfaceColor)
-                        .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
-                ) {
-                    Text("📅", fontSize = 20.sp)
-                }
-
-                IconButton(
-                    onClick = { showSettingsDialog = true },
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(surfaceColor)
-                        .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
-                ) {
-                    Text("⚙️", fontSize = 20.sp)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Box(modifier = Modifier.clickable { showWeatherWeeklyDialog = true }) {
-                WeatherAndDateWidget(isDarkMode = isDarkMode, currentLang = currentLang, weather = weather)
-            }
-
-            Spacer(modifier = Modifier.height(26.dp))
-
-            Text(
-                text = myRemindersText,
-                color = textPrimary,
-                fontSize = 21.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Box(modifier = Modifier.weight(1f)) {
-                if (sortedReminders.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    if (liveLocalTime.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = LanguageManager.getString(context, "no_reminders"),
-                            color = textSecondary,
-                            textAlign = TextAlign.Center,
-                            fontSize = 16.sp
+                            text = liveLocalTime,
+                            color = Color.LightGray,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium
                         )
                     }
-                } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
-                        contentPadding = PaddingValues(bottom = 88.dp)
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // שורת כפתורי העזר (מצב לילה, קלנדר, הגדרות)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = { onToggleDarkMode() },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(surfaceColor)
+                            .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
                     ) {
-                        items(sortedReminders, key = { it.id }) { reminder ->
-                            LuxuryReminderRow(
-                                reminder = reminder,
-                                isDarkMode = isDarkMode,
-                                currentLang = currentLang,
-                                onStatusChange = { updated ->
-                                    reminders = reminders.map { if (it.id == updated.id) updated else it }
-                                },
-                                onDeleteClick = { reminderToDelete = reminder }
+                        Text(if (isDarkMode) "☀️" else "🌙", fontSize = 20.sp)
+                    }
+
+                    IconButton(
+                        onClick = { showCalendarScreen = true },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(surfaceColor)
+                            .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                    ) {
+                        Text("📅", fontSize = 20.sp)
+                    }
+
+                    IconButton(
+                        onClick = { showSettingsDialog = true },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(surfaceColor)
+                            .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                    ) {
+                        Text("⚙️", fontSize = 20.sp)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // ווידג'ט מזג האוויר
+                Box(modifier = Modifier.clickable { showWeatherWeeklyDialog = true }) {
+                    WeatherAndDateWidget(isDarkMode = isDarkMode, currentLang = currentLang, weather = weather)
+                }
+
+                Spacer(modifier = Modifier.height(26.dp))
+
+                Text(
+                    text = myRemindersText,
+                    color = textPrimary,
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // רשימת התזכורות
+                Box(modifier = Modifier.weight(1f)) {
+                    if (sortedReminders.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                text = LanguageManager.getString(context, "no_reminders"),
+                                color = textSecondary,
+                                textAlign = TextAlign.Center,
+                                fontSize = 16.sp
                             )
+                        }
+                    } else {
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(14.dp),
+                            contentPadding = PaddingValues(bottom = 88.dp)
+                        ) {
+                            items(sortedReminders, key = { it.id }) { reminder ->
+                                LuxuryReminderRow(
+                                    reminder = reminder,
+                                    isDarkMode = isDarkMode,
+                                    currentLang = currentLang,
+                                    onStatusChange = { updated ->
+                                        reminders = reminders.map { if (it.id == updated.id) updated else it }
+                                    },
+                                    onDeleteClick = { reminderToDelete = reminder },
+                                    onEditClick = { reminderToEdit = reminder }
+                                )
+                            }
                         }
                     }
                 }
@@ -678,15 +867,32 @@ fun MainScreenContent(
         }
     }
 
+    // דיאלוגים
     if (showAddDialog) {
         AddReminderDialog(
             isDarkMode = isDarkMode,
             currentLang = currentLang,
             initialDate = formatDate(Date()),
             onDismiss = { showAddDialog = false },
-            onAdd = { title, time, date, isRepeating, repeatType, soundUri ->
-                reminders = reminders + createReminder(reminders, title, time, date, isRepeating, repeatType, soundUri)
+            onAdd = { title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds ->
+                reminders = reminders + createReminder(reminders, title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds)
                 showAddDialog = false
+            }
+        )
+    }
+
+    reminderToEdit?.let { editing ->
+        AddReminderDialog(
+            isDarkMode = isDarkMode,
+            currentLang = currentLang,
+            initialDate = editing.date,
+            initial = editing,
+            onDismiss = { reminderToEdit = null },
+            onAdd = { title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds ->
+                reminders = reminders.map {
+                    if (it.id == editing.id) editedReminder(it, title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds) else it
+                }
+                reminderToEdit = null
             }
         )
     }
@@ -705,7 +911,11 @@ fun MainScreenContent(
             isDarkMode = isDarkMode,
             currentLang = currentLang,
             onDismiss = { showSettingsDialog = false },
-            onLanguageChanged = onLanguageChanged
+            onLanguageChanged = onLanguageChanged,
+            onLogout = {
+                showSettingsDialog = false
+                onLogout()
+            }
         )
     }
 
@@ -740,6 +950,7 @@ fun RemindMeCalendarScreen(
     var selectedDate by remember { mutableStateOf(Calendar.getInstance()) }
     var reminders by remember { mutableStateOf(ReminderStorage.loadReminders(context)) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var reminderToEdit by remember { mutableStateOf<ReminderItem?>(null) }
     var reminderToDelete by remember { mutableStateOf<ReminderItem?>(null) }
     var showShareSetupDialog by remember { mutableStateOf(false) }
     var senderNameInput by remember { mutableStateOf("") }
@@ -788,7 +999,7 @@ fun RemindMeCalendarScreen(
                     modifier = Modifier.weight(1f).height(46.dp)
                 ) {
                     Text(
-                        text = if (isRtl) "חזרה ➡️" else "⬅️ Back",
+                        text = tr(currentLang, "חזרה ➡️", "⬅️ Back", "⬅️ Назад", "⬅️ Retour"),
                         color = GoldAccent,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
@@ -916,7 +1127,7 @@ fun RemindMeCalendarScreen(
             Spacer(modifier = Modifier.height(20.dp))
 
             Text(
-                text = "תזכורות לתאריך $selectedDateStr",
+                text = tr(currentLang, "תזכורות לתאריך $selectedDateStr", "Reminders for $selectedDateStr", "Напоминания на $selectedDateStr", "Rappels pour le $selectedDateStr"),
                 color = GoldAccent,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
@@ -956,6 +1167,9 @@ fun RemindMeCalendarScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
+                                        IconButton(onClick = { reminderToEdit = reminder }) {
+                                            Text("✏️", fontSize = 18.sp)
+                                        }
                                         IconButton(onClick = { reminderToDelete = reminder }) {
                                             Text("🗑️", fontSize = 18.sp)
                                         }
@@ -999,13 +1213,13 @@ fun RemindMeCalendarScreen(
         AlertDialog(
             onDismissRequest = { showShareSetupDialog = false },
             containerColor = SurfaceCardDark,
-            title = { Text("שיתוף יומן עם חבר", color = TextPrimaryDark, fontWeight = FontWeight.Bold) },
+            title = { Text(tr(currentLang, "שיתוף יומן עם חבר", "Share calendar with a friend", "Поделиться календарём с другом", "Partager le calendrier avec un ami"), color = TextPrimaryDark, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedTextField(
                         value = senderNameInput,
                         onValueChange = { senderNameInput = it },
-                        label = { Text("השם שלך", color = TextSecondaryDark) },
+                        label = { Text(tr(currentLang, "השם שלך", "Your name", "Ваше имя", "Votre nom"), color = TextSecondaryDark) },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = GoldAccent,
@@ -1020,7 +1234,7 @@ fun RemindMeCalendarScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("התר הרשאת עריכה?", color = TextPrimaryDark, fontSize = 14.sp)
+                        Text(tr(currentLang, "התר הרשאת עריכה?", "Allow editing?", "Разрешить редактирование?", "Autoriser la modification ?"), color = TextPrimaryDark, fontSize = 14.sp)
                         Switch(
                             checked = selectedPermission == "edit",
                             onCheckedChange = { selectedPermission = if (it) "edit" else "read" },
@@ -1039,12 +1253,12 @@ fun RemindMeCalendarScreen(
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground)
                 ) {
-                    Text("שלח קישור בוואטסאפ", fontWeight = FontWeight.Bold)
+                    Text(tr(currentLang, "שלח קישור בוואטסאפ", "Send link via WhatsApp", "Отправить ссылку в WhatsApp", "Envoyer le lien par WhatsApp"), fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showShareSetupDialog = false }) {
-                    Text("ביטול", color = TextSecondaryDark)
+                    Text(commonCancel(currentLang), color = TextSecondaryDark)
                 }
             }
         )
@@ -1056,10 +1270,27 @@ fun RemindMeCalendarScreen(
             currentLang = currentLang,
             initialDate = selectedDateStr,
             onDismiss = { showAddDialog = false },
-            onAdd = { title, time, date, isRepeating, repeatType, soundUri ->
-                reminders = reminders + createReminder(reminders, title, time, date, isRepeating, repeatType, soundUri)
+            onAdd = { title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds ->
+                reminders = reminders + createReminder(reminders, title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds)
                 ReminderStorage.saveReminders(context, reminders)
                 showAddDialog = false
+            }
+        )
+    }
+
+    reminderToEdit?.let { editing ->
+        AddReminderDialog(
+            isDarkMode = true,
+            currentLang = currentLang,
+            initialDate = editing.date,
+            initial = editing,
+            onDismiss = { reminderToEdit = null },
+            onAdd = { title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds ->
+                reminders = reminders.map {
+                    if (it.id == editing.id) editedReminder(it, title, time, date, isRepeating, repeatType, soundUri, advanceMinutes, ringSeconds) else it
+                }
+                ReminderStorage.saveReminders(context, reminders)
+                reminderToEdit = null
             }
         )
     }
@@ -1090,7 +1321,8 @@ fun AddReminderDialog(
     currentLang: String,
     initialDate: String,
     onDismiss: () -> Unit,
-    onAdd: (title: String, time: String, date: String, isRepeating: Boolean, repeatType: String, soundUri: String?) -> Unit
+    onAdd: (title: String, time: String, date: String, isRepeating: Boolean, repeatType: String, soundUri: String?, advanceMinutes: Int, ringSeconds: Int) -> Unit,
+    initial: ReminderItem? = null
 ) {
     val context = LocalContext.current
     val (_, surfaceColor, textPrimary, textSecondary) = appColors(isDarkMode)
@@ -1100,22 +1332,30 @@ fun AddReminderDialog(
     val noSoundTitle = tr(currentLang, "ללא צליל", "No sound", "Без звука", "Silencieux")
     val selectedSoundFallback = tr(currentLang, "צליל שנבחר", "Selected sound", "Выбранный звук", "Son sélectionné")
 
-    var title by remember { mutableStateOf("") }
-    var time by remember { mutableStateOf("") }
-    var date by remember { mutableStateOf(initialDate) }
-    var isRepeating by remember { mutableStateOf(false) }
-    var repeatType by remember { mutableStateOf("DAILY") }
-    var selectedSoundUri by remember { mutableStateOf<String?>(null) }
-    var soundTitle by remember { mutableStateOf(defaultSoundTitle) }
+    var title by remember { mutableStateOf(initial?.title ?: "") }
+    var time by remember { mutableStateOf(initial?.time ?: "") }
+    var date by remember { mutableStateOf(initial?.date?.ifBlank { initialDate } ?: initialDate) }
+    var isRepeating by remember { mutableStateOf(initial?.let { it.repeatType != "NONE" || it.isDaily } ?: false) }
+    var repeatType by remember {
+        mutableStateOf(initial?.let { if (it.repeatType != "NONE") it.repeatType else "DAILY" } ?: "DAILY")
+    }
+    var selectedSoundUri by remember { mutableStateOf<String?>(initial?.soundUri) }
+    var soundTitle by remember {
+        mutableStateOf(if (initial?.soundUri != null) selectedSoundFallback else defaultSoundTitle)
+    }
+    var ringSeconds by remember { mutableStateOf(initial?.ringSeconds?.takeIf { it > 0 } ?: 30) }
     var attemptedSave by remember { mutableStateOf(false) }
 
     var showTimePickerState by remember { mutableStateOf(false) }
     var showDatePickerState by remember { mutableStateOf(false) }
     var showSoundOptionsDialog by remember { mutableStateOf(false) }
-    var showUrlInputDialog by remember { mutableStateOf(false) }
-    var tempUrlInput by remember { mutableStateOf("") }
+    var showSongSearchDialog by remember { mutableStateOf(false) }
 
-    val addTitleText = LanguageManager.getString(context, "add_title")
+    val addTitleText = if (initial != null) {
+        tr(currentLang, "עריכת תזכורת", "Edit Reminder", "Изменить напоминание", "Modifier le rappel")
+    } else {
+        LanguageManager.getString(context, "add_title")
+    }
     val titleLabelText = LanguageManager.getString(context, "reminder_title_label")
     val timeLabelText = LanguageManager.getString(context, "reminder_time_label")
     val dateLabelText = LanguageManager.getString(context, "reminder_date_label")
@@ -1129,10 +1369,30 @@ fun AddReminderDialog(
 
     val titleError = attemptedSave && title.isBlank()
     val timeError = attemptedSave && time.isBlank()
+    var advanceMinutes by remember { mutableStateOf(initial?.advanceMinutes ?: 0) }
+
     val isInPast = !isRepeating && parseDateTime(date, time)?.before(Date()) == true
-    val errorText: String? = if (isInPast) {
-        tr(currentLang, "הזמן שבחרת כבר עבר", "The selected time has already passed", "Выбранное время уже прошло", "L'heure choisie est déjà passée")
-    } else null
+    val isAdvanceInPast = !isRepeating && advanceMinutes > 0 &&
+            (parseDateTime(date, time)?.let { it.time - advanceMinutes * 60_000L < System.currentTimeMillis() } == true)
+    val noteText: String? = when {
+        isInPast -> tr(currentLang, "הזמן כבר עבר – התזכורת תישמר ביומן ולא תצלצל", "This time has passed – the reminder will be saved but won't ring", "Это время уже прошло — напоминание сохранится, но не прозвонит", "Cette heure est passée – le rappel sera enregistré sans sonner")
+        isAdvanceInPast -> tr(currentLang, "ההתראה המוקדמת כבר עברה – תצלצל רק בזמן עצמו", "The early alert time has passed – it will ring only at the time itself", "Раннее уведомление уже прошло — сигнал только в назначенное время", "L'alerte anticipée est passée – sonnerie uniquement à l'heure")
+        else -> null
+    }
+
+    val songPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            // Keep access to the file so the alarm can play it later, even when the app is closed
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) {
+            }
+            selectedSoundUri = uri.toString()
+            soundTitle = uriDisplayName(context, uri) ?: selectedSoundFallback
+        }
+    }
 
     val ringtonePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -1158,98 +1418,153 @@ fun AddReminderDialog(
         ringtonePickerLauncher.launch(intent)
     }
 
+    val sectionBg = if (isDarkMode) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.04f)
+    val goldBrush = androidx.compose.ui.graphics.Brush.horizontalGradient(listOf(Color(0xFFF3DDA5), GoldAccent, Color(0xFFC9A24F)))
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = GoldAccent,
+        unfocusedBorderColor = GoldAccent.copy(alpha = 0.35f),
+        focusedLabelColor = GoldAccent,
+        unfocusedLabelColor = textSecondary,
+        focusedTextColor = textPrimary,
+        unfocusedTextColor = textPrimary,
+        cursorColor = GoldAccent,
+        focusedContainerColor = sectionBg,
+        unfocusedContainerColor = sectionBg
+    )
+
+    @Composable
+    fun PremiumChip(label: String, selected: Boolean, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(if (selected) goldBrush else androidx.compose.ui.graphics.Brush.horizontalGradient(listOf(sectionBg, sectionBg)))
+                .border(1.dp, GoldAccent.copy(alpha = if (selected) 0f else 0.35f), RoundedCornerShape(50))
+                .clickable { onClick() }
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = if (selected) Color(0xFF1B1608) else textPrimary)
+        }
+    }
+
+    @Composable
+    fun SectionTitle(icon: String, text: String) {
+        Text("$icon  $text", color = GoldAccent, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+    }
+
+    @Composable
+    fun PickTile(icon: String, label: String, value: String, isError: Boolean, modifier: Modifier, onClick: () -> Unit) {
+        Column(
+            modifier = modifier
+                .clip(RoundedCornerShape(18.dp))
+                .background(sectionBg)
+                .border(1.dp, if (isError) MaterialTheme.colorScheme.error else GoldAccent.copy(alpha = 0.4f), RoundedCornerShape(18.dp))
+                .clickable { onClick() }
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            Text("$icon  $label", color = textSecondary, fontSize = 11.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (value.isBlank()) "––:––" else "\u2066$value\u2069",
+                color = if (value.isBlank()) textSecondary else textPrimary,
+                fontSize = 17.sp,
+                maxLines = 1,
+                softWrap = false,
+                fontWeight = FontWeight.ExtraBold
+            )
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = surfaceColor,
-        title = { Text(addTitleText, color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 20.sp) },
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier.size(42.dp).clip(CircleShape).background(goldBrush),
+                    contentAlignment = Alignment.Center
+                ) { Text(if (initial != null) "✏️" else "⏰", fontSize = 20.sp) }
+                Spacer(Modifier.width(12.dp))
+                Text(addTitleText, color = textPrimary, fontWeight = FontWeight.ExtraBold, fontSize = 22.sp)
+            }
+        },
         text = {
             Column(
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
                 modifier = Modifier.verticalScroll(rememberScrollState())
             ) {
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
                     label = { Text(titleLabelText, color = if (titleError) MaterialTheme.colorScheme.error else textSecondary) },
+                    leadingIcon = { Text("📝", fontSize = 18.sp) },
                     singleLine = true,
                     isError = titleError,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = GoldAccent,
-                        unfocusedBorderColor = textSecondary.copy(alpha = 0.5f),
-                        focusedLabelColor = GoldAccent,
-                        focusedTextColor = textPrimary,
-                        unfocusedTextColor = textPrimary,
-                        cursorColor = GoldAccent
-                    ),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = fieldColors,
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                Box(modifier = Modifier.fillMaxWidth().clickable { showTimePickerState = true }) {
-                    OutlinedTextField(
-                        value = time,
-                        onValueChange = {},
-                        readOnly = true,
-                        enabled = false,
-                        label = { Text(timeLabelText, color = if (timeError) MaterialTheme.colorScheme.error else textSecondary) },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            disabledBorderColor = if (timeError) MaterialTheme.colorScheme.error else GoldAccent,
-                            disabledLabelColor = if (timeError) MaterialTheme.colorScheme.error else textSecondary,
-                            disabledTextColor = textPrimary
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    PickTile("🕐", timeLabelText, time, timeError, Modifier.weight(1f)) { showTimePickerState = true }
+                    PickTile("📅", dateLabelText, date, false, Modifier.weight(1f)) { showDatePickerState = true }
                 }
 
-                Box(modifier = Modifier.fillMaxWidth().clickable { showDatePickerState = true }) {
-                    OutlinedTextField(
-                        value = date,
-                        onValueChange = {},
-                        readOnly = true,
-                        enabled = false,
-                        label = { Text(dateLabelText, color = textSecondary) },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            disabledBorderColor = GoldAccent,
-                            disabledLabelColor = textSecondary,
-                            disabledTextColor = textPrimary
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                if (noteText != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(GoldAccent.copy(alpha = 0.12f))
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("ℹ️", fontSize = 14.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(noteText, color = textPrimary, fontSize = 12.sp)
+                    }
                 }
 
-                if (errorText != null) {
-                    Text(text = errorText, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                Column(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(sectionBg).padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(text = repeatToggleText, color = textPrimary, fontSize = 14.sp)
-                    Switch(
-                        checked = isRepeating,
-                        onCheckedChange = { isRepeating = it },
-                        colors = SwitchDefaults.colors(checkedThumbColor = if (isDarkMode) DarkBackground else SurfaceCardLight, checkedTrackColor = GoldAccent)
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("🔁  $repeatToggleText", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = isRepeating,
+                            onCheckedChange = { isRepeating = it },
+                            colors = SwitchDefaults.colors(checkedThumbColor = if (isDarkMode) DarkBackground else SurfaceCardLight, checkedTrackColor = GoldAccent)
+                        )
+                    }
+                    if (isRepeating) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        ) {
+                            repeatOptions.forEach { typeCode ->
+                                PremiumChip(repeatUnitLabel(currentLang, typeCode), repeatType == typeCode) { repeatType = typeCode }
+                            }
+                        }
+                    }
                 }
 
-                if (isRepeating) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.fillMaxWidth()) {
-                        repeatOptions.forEach { typeCode ->
-                            val isSelected = repeatType == typeCode
-                            Button(
-                                onClick = { repeatType = typeCode },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isSelected) GoldAccent else surfaceColor,
-                                    contentColor = if (isSelected) DarkBackground else textPrimary
-                                ),
-                                shape = RoundedCornerShape(10.dp),
-                                border = BorderStroke(1.dp, GoldAccent.copy(alpha = 0.5f)),
-                                modifier = Modifier.weight(1f),
-                                contentPadding = PaddingValues(2.dp)
-                            ) {
-                                Text(text = repeatUnitLabel(currentLang, typeCode), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
+                Column(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(sectionBg).padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    SectionTitle("🔔", tr(currentLang, "התראה מוקדמת", "Early alert", "Раннее уведомление", "Alerte anticipée"))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                    ) {
+                        advanceOptions.forEach { minutes ->
+                            PremiumChip(advanceLabel(currentLang, minutes), advanceMinutes == minutes) { advanceMinutes = minutes }
                         }
                     }
                 }
@@ -1257,33 +1572,41 @@ fun AddReminderDialog(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(fieldBackground)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(sectionBg)
+                        .border(1.dp, GoldAccent.copy(alpha = 0.35f), RoundedCornerShape(18.dp))
                         .clickable { showSoundOptionsDialog = true }
-                        .padding(12.dp),
+                        .padding(14.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(text = soundLabelText, color = textSecondary, fontSize = 12.sp)
+                        Text(text = soundLabelText, color = textSecondary, fontSize = 11.sp)
                         Spacer(modifier = Modifier.height(2.dp))
-                        Text(text = soundTitle, color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                        Text(text = soundTitle, color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    Text(text = "🔔", fontSize = 20.sp)
+                    Box(
+                        modifier = Modifier.size(38.dp).clip(CircleShape).background(GoldAccent.copy(alpha = 0.18f)),
+                        contentAlignment = Alignment.Center
+                    ) { Text("🎵", fontSize = 18.sp) }
                 }
             }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    attemptedSave = true
-                    if (title.isNotBlank() && time.isNotBlank() && !isInPast) {
-                        onAdd(title.trim(), time, date, isRepeating, repeatType, selectedSoundUri)
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(goldBrush)
+                    .clickable {
+                        attemptedSave = true
+                        if (title.isNotBlank() && time.isNotBlank()) {
+                            onAdd(title.trim(), time, date, isRepeating, repeatType, selectedSoundUri, advanceMinutes, ringSeconds)
+                        }
                     }
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground)
+                    .padding(horizontal = 24.dp, vertical = 12.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text(saveScheduleText, fontWeight = FontWeight.Bold)
+                Text(if (initial != null) okText else saveScheduleText, color = Color(0xFF1B1608), fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
             }
         },
         dismissButton = {
@@ -1316,13 +1639,23 @@ fun AddReminderDialog(
                     Button(
                         onClick = {
                             showSoundOptionsDialog = false
-                            tempUrlInput = ""
-                            showUrlInputDialog = true
+                            showSongSearchDialog = true
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(tr(currentLang, "🎵 חיפוש שיר או קישור", "🎵 Search Song or Link", "🎵 Поиск песни или ссылка", "🎵 Chanson ou lien"))
+                        Text(tr(currentLang, "🔎 חיפוש שיר לפי שם", "🔎 Search song by name", "🔎 Поиск песни по названию", "🔎 Rechercher une chanson"))
+                    }
+
+                    Button(
+                        onClick = {
+                            showSoundOptionsDialog = false
+                            songPickerLauncher.launch(arrayOf("audio/*"))
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(tr(currentLang, "🎵 שיר מהטלפון", "🎵 Song from phone", "🎵 Песня с телефона", "🎵 Chanson du téléphone"))
                     }
                 }
             },
@@ -1335,19 +1668,26 @@ fun AddReminderDialog(
         )
     }
 
-    if (showUrlInputDialog) {
-        var searchQuery by remember { mutableStateOf(tempUrlInput) }
-        var searchResults by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    if (showSongSearchDialog) {
+        var searchQuery by remember { mutableStateOf("") }
+        var searchResults by remember { mutableStateOf<List<SongResult>>(emptyList()) }
         var isSearching by remember { mutableStateOf(false) }
+        var isDownloading by remember { mutableStateOf(false) }
+        var errorMessage by remember { mutableStateOf<String?>(null) }
+        val scope = rememberCoroutineScope()
 
-        val dialogTitle = tr(currentLang, "חיפוש שיר או הדבקת קישור", "Search Song or Paste Link", "Поиск песни или ссылка", "Rechercher une chanson ou un lien")
-        val placeholderText = tr(currentLang, "חפש שיר...", "Search song title...", "Поиск песни...", "Rechercher une chanson...")
+        val networkError = tr(currentLang, "אין חיבור לאינטרנט או שהחיפוש נכשל", "No internet connection or the search failed", "Нет интернета или поиск не удался", "Pas de connexion ou la recherche a échoué")
+        val downloadError = tr(currentLang, "לא הצלחנו לשמור את השיר, נסה שיר אחר", "Couldn't save the song, try another one", "Не удалось сохранить песню, попробуйте другую", "Impossible d'enregistrer la chanson, essayez-en une autre")
+        val noResults = tr(currentLang, "לא נמצאו שירים", "No songs found", "Песни не найдены", "Aucune chanson trouvée")
 
         LaunchedEffect(searchQuery) {
-            if (searchQuery.isNotBlank() && !searchQuery.startsWith("http")) {
-                delay(400)
+            errorMessage = null
+            if (searchQuery.trim().length >= 2) {
+                delay(500)
                 isSearching = true
-                searchResults = fetchSongSuggestions(searchQuery)
+                val found = searchSongs(searchQuery.trim())
+                searchResults = found ?: emptyList()
+                errorMessage = if (found == null) networkError else if (found.isEmpty()) noResults else null
                 isSearching = false
             } else {
                 searchResults = emptyList()
@@ -1356,15 +1696,17 @@ fun AddReminderDialog(
         }
 
         AlertDialog(
-            onDismissRequest = { showUrlInputDialog = false },
+            onDismissRequest = { if (!isDownloading) showSongSearchDialog = false },
             containerColor = surfaceColor,
-            title = { Text(dialogTitle, color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp) },
+            title = {
+                Text(tr(currentLang, "חיפוש שיר", "Search Song", "Поиск песни", "Rechercher une chanson"), color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        label = { Text(placeholderText, color = textSecondary) },
+                        label = { Text(tr(currentLang, "שם שיר או אמן", "Song or artist name", "Название песни или исполнитель", "Nom de la chanson ou de l'artiste"), color = textSecondary) },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = GoldAccent,
@@ -1377,56 +1719,67 @@ fun AddReminderDialog(
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    if (isSearching) {
+                    Text(
+                        text = tr(
+                            currentLang,
+                            "מהחיפוש אפשר לקבל רק קטע של 30 שניות (מגבלת זכויות יוצרים). כדי שיתנגן שיר שלם – בחר \"שיר מהטלפון\"."
+                            ,"Search gives only a 30-second clip (copyright limit). To play a full song, choose \"Song from phone\"."
+                            ,"Поиск даёт только 30-секундный фрагмент (авторские права). Для полной песни выберите «Песня с телефона»."
+                            ,"La recherche donne seulement un extrait de 30 s (droits d'auteur). Pour une chanson entière, choisissez « Chanson du téléphone »."
+                        ),
+                        color = textSecondary,
+                        fontSize = 12.sp
+                    )
+
+                    if (isSearching || isDownloading) {
                         Box(modifier = Modifier.fillMaxWidth().padding(8.dp), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator(color = GoldAccent)
                         }
                     }
 
+                    errorMessage?.let {
+                        Text(text = it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                    }
+
                     if (searchResults.isNotEmpty()) {
                         LazyColumn(
                             verticalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.heightIn(max = 160.dp)
+                            modifier = Modifier.heightIn(max = 220.dp)
                         ) {
-                            items(searchResults) { (titleText, url) ->
-                                Row(
+                            items(searchResults) { song ->
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(8.dp))
                                         .background(fieldBackground)
-                                        .clickable {
-                                            selectedSoundUri = url
-                                            soundTitle = titleText
-                                            showUrlInputDialog = false
-                                            showSoundOptionsDialog = false
+                                        .clickable(enabled = !isDownloading) {
+                                            scope.launch {
+                                                isDownloading = true
+                                                errorMessage = null
+                                                val savedUri = downloadPreview(context, song.previewUrl)
+                                                isDownloading = false
+                                                if (savedUri != null) {
+                                                    selectedSoundUri = savedUri
+                                                    soundTitle = "${song.artist} – ${song.title}"
+                                                    showSongSearchDialog = false
+                                                } else {
+                                                    errorMessage = downloadError
+                                                }
+                                            }
                                         }
-                                        .padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                        .padding(10.dp)
                                 ) {
-                                    Text(text = "🎵 $titleText", color = textPrimary, fontSize = 14.sp, maxLines = 1)
+                                    Text(text = "🎵 ${song.title}", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                                    Text(text = song.artist, color = textSecondary, fontSize = 12.sp, maxLines = 1)
                                 }
                             }
                         }
                     }
                 }
             },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (searchQuery.isNotBlank()) {
-                            selectedSoundUri = if (searchQuery.startsWith("http")) searchQuery else youtubeSearchUrl(searchQuery)
-                            soundTitle = searchQuery
-                            showUrlInputDialog = false
-                            showSoundOptionsDialog = false
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground)
-                ) {
-                    Text(okText, fontWeight = FontWeight.Bold)
-                }
-            },
+            confirmButton = {},
             dismissButton = {
-                TextButton(onClick = { showUrlInputDialog = false }) {
+                TextButton(onClick = { if (!isDownloading) showSongSearchDialog = false }) {
                     Text(cancelText, color = textSecondary)
                 }
             }
@@ -1624,7 +1977,14 @@ fun WeeklyWeatherDialog(
 @Composable
 fun WeatherAndDateWidget(isDarkMode: Boolean, currentLang: String, weather: WeatherState? = null) {
     val (_, surfaceColor, textPrimary, textSecondary) = appColors(isDarkMode)
-    val dateFormat = SimpleDateFormat("EEEE, d MMMM", Locale.forLanguageTag(currentLang))
+
+    val locale = when (currentLang) {
+        "he" -> Locale("iw", "IL")
+        "ru" -> Locale("ru", "RU")
+        "fr" -> Locale("fr", "FR")
+        else -> Locale.US
+    }
+    val dateFormat = SimpleDateFormat("EEEE, d MMMM", locale)
     val currentDateStr = dateFormat.format(Date())
 
     Card(
@@ -1641,7 +2001,7 @@ fun WeatherAndDateWidget(isDarkMode: Boolean, currentLang: String, weather: Weat
                 Text(text = currentDateStr, color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = tr(currentLang, "ישראל, נתניה", "Israel, Netanya", "Израиль, Нетания", "Israël, Netanya"),
+                    text = weather?.cityName?.takeIf { it.isNotBlank() } ?: tr(currentLang, "ישראל, נתניה", "Israel, Netanya", "Израиль, Нетания", "Israël, Netanya"),
                     color = textSecondary,
                     fontSize = 13.sp
                 )
@@ -1666,9 +2026,14 @@ fun SettingsDialog(
     isDarkMode: Boolean,
     currentLang: String,
     onDismiss: () -> Unit,
-    onLanguageChanged: (String) -> Unit
+    onLanguageChanged: (String) -> Unit,
+    onLogout: () -> Unit = {}
 ) {
+    val context = LocalContext.current
     val (_, surfaceColor, textPrimary, textSecondary) = appColors(isDarkMode)
+
+    var showLogoutConfirm by remember { mutableStateOf(false) }
+    var windowMode by remember { mutableStateOf(ReminderStorage.getAlarmWindowMode(context)) }
 
     val languages = listOf(
         "he" to "🇮🇱 עברית",
@@ -1677,18 +2042,43 @@ fun SettingsDialog(
         "fr" to "🇫🇷 Français"
     )
 
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            containerColor = surfaceColor,
+            title = { Text(LanguageManager.getString(context, "logout_title"), color = textPrimary, fontWeight = FontWeight.Bold) },
+            text = { Text(LanguageManager.getString(context, "logout_msg"), color = textSecondary) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showLogoutConfirm = false
+                    onLogout()
+                }) {
+                    Text(LanguageManager.getString(context, "logout"), color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) {
+                    Text(commonCancel(currentLang), color = textSecondary)
+                }
+            }
+        )
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = surfaceColor,
         title = {
             Text(
-                text = tr(currentLang, "הגדרות שפה", "Language Settings", "Настройки языка", "Paramètres de langue"),
+                text = LanguageManager.getString(context, "settings_title"),
                 color = textPrimary,
                 fontWeight = FontWeight.Bold
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
                 Text(text = tr(currentLang, "בחר שפת ממשק:", "Choose interface language:", "Выберите язык интерфейса:", "Choisissez la langue :"), color = textSecondary)
                 Spacer(modifier = Modifier.height(4.dp))
                 languages.forEach { (code, label) ->
@@ -1706,6 +2096,43 @@ fun SettingsDialog(
                         Text(text = label, fontWeight = FontWeight.Bold)
                     }
                 }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = LanguageManager.getString(context, "alert_display"), color = textSecondary)
+                Spacer(modifier = Modifier.height(4.dp))
+                listOf("FULL" to "alert_mode_full", "QUARTER" to "alert_mode_quarter").forEach { (mode, labelKey) ->
+                    Button(
+                        onClick = {
+                            windowMode = mode
+                            ReminderStorage.saveAlarmWindowMode(context, mode)
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (windowMode == mode) GoldAccent else surfaceColor,
+                            contentColor = if (windowMode == mode) DarkBackground else textPrimary
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(text = LanguageManager.getString(context, labelKey), fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = LanguageManager.getString(context, "account_label"), color = textSecondary)
+                CloudSync.email()?.let { email ->
+                    Text(
+                        text = String.format(LanguageManager.getString(context, "logged_in_as"), email),
+                        color = textPrimary,
+                        fontSize = 14.sp
+                    )
+                }
+                OutlinedButton(
+                    onClick = { showLogoutConfirm = true },
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(text = LanguageManager.getString(context, "logout"), fontWeight = FontWeight.Bold)
+                }
             }
         },
         confirmButton = {
@@ -1719,51 +2146,129 @@ fun SettingsDialog(
 // ───────────────────────────── Luxury Reminder Row ─────────────────────────────
 
 @Composable
+private fun ReminderChip(text: String, textColor: Color) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(GoldAccent.copy(alpha = 0.12f))
+            .border(1.dp, GoldAccent.copy(alpha = 0.25f), RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        Text(text = text, color = textColor, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
 fun LuxuryReminderRow(
     reminder: ReminderItem,
     isDarkMode: Boolean,
     currentLang: String,
     onStatusChange: (ReminderItem) -> Unit,
-    onDeleteClick: () -> Unit
+    onDeleteClick: () -> Unit,
+    onEditClick: () -> Unit = {}
 ) {
     val (_, surfaceColor, textPrimary, textSecondary) = appColors(isDarkMode)
     val repeatKey = if (reminder.repeatType != "NONE") reminder.repeatType else if (reminder.isDaily) "DAILY" else "NONE"
     val badge = repeatBadge(currentLang, repeatKey)
+    val advance = advanceBadge(currentLang, reminder.advanceMinutes)
+    val hasChips = reminder.date.isNotBlank() || badge != null || advance != null || reminder.isPassed()
 
     Card(
         colors = CardDefaults.cardColors(containerColor = surfaceColor),
-        shape = RoundedCornerShape(16.dp),
-        border = BorderStroke(1.dp, GoldAccent.copy(alpha = 0.2f)),
-        modifier = Modifier.fillMaxWidth().alpha(if (reminder.isEnabled) 1f else 0.55f)
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, GoldAccent.copy(alpha = 0.25f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(if (!reminder.isEnabled) 0.55f else if (reminder.isPassed()) 0.75f else 1f)
+            .clickable { onEditClick() }
     ) {
-        Row(
-            modifier = Modifier.padding(16.dp).fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(text = reminder.title, color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(text = "⏰ ${reminder.time}", color = GoldAccent, fontSize = 13.sp)
+        Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = reminder.title,
+                    color = textPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                // The time is always shown left-to-right so the digits never get mixed up
+                Text(
+                    text = "\u2066${reminder.time}\u2069",
+                    color = GoldAccent,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 30.sp
+                )
+            }
+
+            if (hasChips) {
+                Spacer(modifier = Modifier.height(10.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     if (reminder.date.isNotBlank()) {
-                        Text(text = "📅 ${reminder.date}", color = textSecondary, fontSize = 13.sp)
+                        ReminderChip("📅 \u2066${reminder.date}\u2069", textSecondary)
                     }
-                }
-                if (badge != null) {
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(text = "🔁 $badge", color = textSecondary, fontSize = 12.sp)
+                    if (badge != null) {
+                        ReminderChip("🔁 $badge", textSecondary)
+                    }
+                    if (advance != null) {
+                        ReminderChip("🔔 $advance", textSecondary)
+                    }
+                    if (reminder.isPassed()) {
+                        ReminderChip("⌛ " + tr(currentLang, "עבר", "Passed", "Прошло", "Passé"), textSecondary)
+                    }
                 }
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(modifier = Modifier.height(10.dp))
+            HorizontalDivider(color = GoldAccent.copy(alpha = 0.15f), thickness = 1.dp)
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Switch(
                     checked = reminder.isEnabled,
                     onCheckedChange = { onStatusChange(reminder.copy(isEnabled = it)) },
-                    colors = SwitchDefaults.colors(checkedThumbColor = if (isDarkMode) DarkBackground else SurfaceCardLight, checkedTrackColor = GoldAccent)
+                    modifier = Modifier.scale(0.85f),
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = if (isDarkMode) DarkBackground else SurfaceCardLight,
+                        checkedTrackColor = GoldAccent
+                    )
                 )
-                IconButton(onClick = onDeleteClick) {
-                    Text("🗑️", fontSize = 18.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(GoldAccent.copy(alpha = 0.14f))
+                            .clickable { onEditClick() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("✏️", fontSize = 16.sp)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.error.copy(alpha = 0.14f))
+                            .clickable { onDeleteClick() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("🗑️", fontSize = 16.sp)
+                    }
                 }
             }
         }
@@ -1841,7 +2346,7 @@ fun DatePickerDialogWrapper(
     val datePickerState = rememberDatePickerState(
         initialSelectedDateMillis = dateStringToUtcMillis(initialDate),
         selectableDates = object : SelectableDates {
-            override fun isSelectableDate(utcTimeMillis: Long): Boolean = utcTimeMillis >= todayUtcMillis
+            override fun isSelectableDate(utcTimeMillis: Long): Boolean = true
         }
     )
 

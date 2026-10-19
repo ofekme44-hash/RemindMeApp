@@ -35,6 +35,8 @@ object ReminderStorage {
                 put("isDaily", item.isDaily)
                 put("repeatType", item.repeatType)
                 put("soundUri", item.soundUri ?: JSONObject.NULL)
+                put("advanceMinutes", item.advanceMinutes)
+                put("ringSeconds", item.ringSeconds)
             }
             jsonArray.put(jsonObject)
         }
@@ -50,6 +52,43 @@ object ReminderStorage {
         reminders.forEach { syncAlarm(context, it) }
 
         // רענון אוטומטי של הווידג'ט מיד עם שמירת התזכורת
+        refreshWidgets(context)
+
+        // גיבוי לחשבון Google (אם מחוברים)
+        CloudSync.push(context)
+    }
+
+    /** The saved reminders exactly as stored, for the cloud backup. */
+    fun getRemindersJson(context: Context): String =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_REMINDERS, null) ?: "[]"
+
+    /** Replaces everything on the phone with the data from the cloud and re-arms the alarms. */
+    fun replaceAllFromCloud(context: Context, json: String) {
+        val valid = try {
+            JSONArray(json)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (!valid) return
+
+        loadReminders(context).forEach { NotificationHelper.cancelReminder(context, it.id) }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit {
+            putString(KEY_REMINDERS, json)
+            putBoolean(KEY_INITIALIZED, true)
+        }
+        loadReminders(context).forEach { syncAlarm(context, it) }
+        refreshWidgets(context)
+    }
+
+    /** Used on sign-out: removes this account's reminders and alarms from the phone. */
+    fun clearAllLocal(context: Context) {
+        loadReminders(context).forEach { NotificationHelper.cancelReminder(context, it.id) }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit {
+            putString(KEY_REMINDERS, "[]")
+            putBoolean(KEY_INITIALIZED, true)
+        }
+        AlarmService.stop(context)
         refreshWidgets(context)
     }
 
@@ -68,7 +107,9 @@ object ReminderStorage {
                 dateStr = item.date,
                 timeStr = item.time,
                 soundUri = item.soundUri,
-                repeatType = repeatType
+                repeatType = repeatType,
+                advanceMinutes = item.advanceMinutes,
+                ringSeconds = item.ringSeconds
             )
         } else {
             NotificationHelper.cancelReminder(context, item.id)
@@ -120,7 +161,9 @@ object ReminderStorage {
                             isEnabled = obj.optBoolean("isEnabled", true),
                             isDaily = obj.optBoolean("isDaily", false),
                             repeatType = obj.optString("repeatType", "NONE"),
-                            soundUri = if (obj.has("soundUri") && !obj.isNull("soundUri")) obj.getString("soundUri") else null
+                            soundUri = if (obj.has("soundUri") && !obj.isNull("soundUri")) obj.getString("soundUri") else null,
+                            advanceMinutes = obj.optInt("advanceMinutes", 0),
+                            ringSeconds = obj.optInt("ringSeconds", 0)
                         )
                     )
                 }
@@ -134,10 +177,13 @@ object ReminderStorage {
 
     fun saveAlarmWindowMode(context: Context, mode: String) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putString(KEY_ALARM_WINDOW_MODE, mode) }
+        CloudSync.push(context)
     }
 
     fun getAlarmWindowMode(context: Context): String {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_ALARM_WINDOW_MODE, "HALF") ?: "HALF"
+        // "FULL" = full screen (default), "QUARTER" = top quarter of the screen
+        val saved = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_ALARM_WINDOW_MODE, "FULL")
+        return if (saved == "QUARTER") "QUARTER" else "FULL"
     }
 
     fun saveRingSettings(context: Context, durationSec: Int, snoozeCount: Int) {
@@ -145,6 +191,7 @@ object ReminderStorage {
             putInt(KEY_RING_DURATION_SEC, durationSec)
             putInt(KEY_SNOOZE_COUNT, snoozeCount)
         }
+        CloudSync.push(context)
     }
 
     fun getRingDurationSec(context: Context): Int {
