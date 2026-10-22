@@ -19,6 +19,8 @@ import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import com.example.remindme.ui.theme.reminderAccentArgb
+import com.example.remindme.ui.theme.reminderIcon
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -52,7 +54,17 @@ class ReminderReceiver : BroadcastReceiver() {
         val soundUri = intent.getStringExtra("soundUri")
         val phone = intent.getStringExtra("phone")
 
-        val fullScreenIntent = NotificationHelper.alarmActivityIntent(context, title, soundUri, phone)
+        val reminderId = intent.getIntExtra("id", -1)
+        val savedReminder = try {
+            ReminderStorage.loadReminders(context).firstOrNull { it.id == reminderId }
+        } catch (_: Exception) {
+            null
+        }
+        // A snoozed alarm carries its own look, because the reminder may no longer be in the list
+        val notes = savedReminder?.notes ?: intent.getStringExtra("notes")
+        val accent = savedReminder?.let { reminderAccentArgb(it) } ?: intent.getIntExtra("accent", 0)
+        val icon = savedReminder?.let { reminderIcon(it) } ?: intent.getStringExtra("icon").orEmpty()
+        val fullScreenIntent = NotificationHelper.alarmActivityIntent(context, title, soundUri, phone, notes, accent, icon)
 
         // Turn the screen on, so the alert is visible even when the phone is off/locked
         try {
@@ -73,6 +85,9 @@ class ReminderReceiver : BroadcastReceiver() {
                     putExtra("soundUri", soundUri)
                     putExtra("phone", phone)
                     putExtra("ringSeconds", ringSeconds)
+                    putExtra("notes", notes)
+                    putExtra("accent", accent)
+                    putExtra("icon", icon)
                 }
             )
             true
@@ -165,7 +180,10 @@ class AlarmService : Service() {
         releasePlayer()
 
         NotificationHelper.ensureAlarmChannel(this)
-        val fullScreenIntent = NotificationHelper.alarmActivityIntent(this, title, soundUri, phone)
+        val notes = intent?.getStringExtra("notes")
+        val accent = intent?.getIntExtra("accent", 0) ?: 0
+        val icon = intent?.getStringExtra("icon").orEmpty()
+        val fullScreenIntent = NotificationHelper.alarmActivityIntent(this, title, soundUri, phone, notes, accent, icon)
         val notification = NotificationHelper.buildAlarmNotification(
             context = this,
             channelId = NotificationHelper.ALARM_CHANNEL_ID,
@@ -266,12 +284,31 @@ class AlarmService : Service() {
                 }
             }
             mp.prepare()
+            // Start quietly and get louder over a few seconds
+            rampVolume = 0.05f
+            mp.setVolume(rampVolume, rampVolume)
             mp.start()
             player = mp
+            handler.removeCallbacks(rampRunnable)
+            handler.postDelayed(rampRunnable, 400L)
             true
         } catch (_: Exception) {
             releasePlayer()
             false
+        }
+    }
+
+    private var rampVolume = 1f
+    private val rampRunnable = object : Runnable {
+        override fun run() {
+            val p = player ?: return
+            rampVolume = (rampVolume + 0.06f).coerceAtMost(1f)
+            try {
+                p.setVolume(rampVolume, rampVolume)
+            } catch (_: Exception) {
+                return
+            }
+            if (rampVolume < 1f) handler.postDelayed(this, 400L)
         }
     }
 
@@ -438,9 +475,12 @@ object NotificationHelper {
         }
     }
 
-    fun alarmActivityIntent(context: Context, title: String, soundUri: String?, phone: String?): Intent =
+    fun alarmActivityIntent(context: Context, title: String, soundUri: String?, phone: String?, notes: String? = null, accent: Int = 0, icon: String = ""): Intent =
         Intent(context, AlarmAlertActivity::class.java).apply {
             putExtra("title", title)
+            putExtra("notes", notes)
+            putExtra("accent", accent)
+            putExtra("icon", icon)
             putExtra("soundUri", soundUri)
             putExtra("phone", phone)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -610,6 +650,39 @@ object NotificationHelper {
             }
         } else {
             alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+        }
+    }
+
+    /** Rings the same alert again after [minutes]. */
+    fun snooze(
+        context: Context,
+        title: String,
+        soundUri: String?,
+        phone: String?,
+        notes: String?,
+        accent: Int,
+        icon: String,
+        minutes: Int = 5
+    ) {
+        try {
+            val intent = Intent(context, ReminderReceiver::class.java).apply {
+                putExtra("id", -1)
+                putExtra("title", title)
+                putExtra("soundUri", soundUri)
+                putExtra("phone", phone)
+                putExtra("notes", notes)
+                putExtra("accent", accent)
+                putExtra("icon", icon)
+                putExtra("repeatType", "NONE")
+            }
+            val code = 3_000_000 + (kotlin.math.abs(title.hashCode()) % 100_000)
+            val pendingIntent = PendingIntent.getBroadcast(
+                context, code, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            setAlarm(context, System.currentTimeMillis() + minutes * 60_000L, pendingIntent)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 

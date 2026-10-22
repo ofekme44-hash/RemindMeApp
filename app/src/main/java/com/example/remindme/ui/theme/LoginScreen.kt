@@ -4,6 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -42,7 +46,7 @@ fun LoginScreen(onSignedIn: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBackground)
+            .premiumBackground(true)
             .padding(28.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -50,13 +54,32 @@ fun LoginScreen(onSignedIn: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text(text = "🔔", fontSize = 64.sp)
-            Spacer(modifier = Modifier.height(16.dp))
+            Box(
+                modifier = Modifier
+                    .size(124.dp)
+                    .clip(CircleShape)
+                    .background(GoldAccent.copy(alpha = 0.12f))
+                    .border(2.dp, GoldAccent.copy(alpha = 0.55f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = "🔔", fontSize = 58.sp)
+            }
+            Spacer(modifier = Modifier.height(22.dp))
+            Text(
+                text = "RemindMe",
+                style = androidx.compose.ui.text.TextStyle(
+                    brush = GoldBrush,
+                    fontSize = 40.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 2.sp
+                )
+            )
+            Spacer(modifier = Modifier.height(10.dp))
             Text(
                 text = text("login_title"),
                 color = GoldAccent,
-                fontSize = 26.sp,
-                fontWeight = FontWeight.ExtraBold,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(12.dp))
@@ -66,7 +89,9 @@ fun LoginScreen(onSignedIn: () -> Unit) {
                 fontSize = 15.sp,
                 textAlign = TextAlign.Center
             )
-            Spacer(modifier = Modifier.height(36.dp))
+            Spacer(modifier = Modifier.height(18.dp))
+            Text(text = "⏰    ☁️    🎵    🔔", fontSize = 22.sp, letterSpacing = 2.sp)
+            Spacer(modifier = Modifier.height(32.dp))
 
             if (isLoading) {
                 CircularProgressIndicator(color = GoldAccent)
@@ -102,11 +127,14 @@ fun LoginScreen(onSignedIn: () -> Unit) {
                             }
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = GoldAccent, contentColor = DarkBackground),
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.fillMaxWidth().height(54.dp)
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent, contentColor = Color(0xFF1B1608)),
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(58.dp)
+                        .background(GoldBrush, RoundedCornerShape(18.dp))
                 ) {
-                    Text(text("login_button"), fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text(text("login_button"), fontSize = 17.sp, fontWeight = FontWeight.ExtraBold)
                 }
             }
 

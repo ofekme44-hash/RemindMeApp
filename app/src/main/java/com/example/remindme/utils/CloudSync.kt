@@ -66,6 +66,7 @@ object CloudSync {
 
     private fun snapshot(context: Context): Map<String, Any> = mapOf(
         "reminders" to ReminderStorage.getRemindersJson(context),
+        "history" to ReminderStorage.getHistoryJson(context),
         "alarmWindowMode" to ReminderStorage.getAlarmWindowMode(context),
         "ringDurationSec" to ReminderStorage.getRingDurationSec(context),
         "snoozeCount" to ReminderStorage.getSnoozeCount(context),
@@ -104,9 +105,16 @@ object CloudSync {
         return try {
             val snap = db.collection("users").document(uid).get().await()
             if (snap.exists()) {
+                var historyMissing = false
                 applying = true
                 try {
                     ReminderStorage.replaceAllFromCloud(appContext, snap.getString("reminders") ?: "[]")
+                    val cloudHistory = snap.getString("history")
+                    if (cloudHistory != null) {
+                        ReminderStorage.replaceHistoryFromCloud(appContext, cloudHistory)
+                    } else {
+                        historyMissing = true
+                    }
                     snap.getString("alarmWindowMode")?.let { ReminderStorage.saveAlarmWindowMode(appContext, it) }
                     val duration = snap.getLong("ringDurationSec")
                     val count = snap.getLong("snoozeCount")
@@ -116,6 +124,8 @@ object CloudSync {
                 } finally {
                     applying = false
                 }
+                // An account saved before the history existed: upload what is on this phone
+                if (historyMissing) push(appContext)
             } else {
                 pushAndWait(appContext)
             }

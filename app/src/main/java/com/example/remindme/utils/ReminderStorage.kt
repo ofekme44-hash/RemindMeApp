@@ -9,7 +9,13 @@ import com.example.remindme.ui.theme.ReminderItem
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** A reminder that is no longer active: its time passed, or it was deleted. */
+data class HistoryEntry(val reminder: ReminderItem, val reason: String, val at: Long) // reason: "PASSED" or "DELETED"
+
 object ReminderStorage {
+    private const val KEY_HISTORY = "reminder_history"
+    private const val HISTORY_LIMIT = 300
+
     private const val PREFS_NAME = "remindme_prefs"
     private const val KEY_REMINDERS = "saved_reminders"
     private const val KEY_INITIALIZED = "is_initialized"
@@ -37,6 +43,9 @@ object ReminderStorage {
                 put("soundUri", item.soundUri ?: JSONObject.NULL)
                 put("advanceMinutes", item.advanceMinutes)
                 put("ringSeconds", item.ringSeconds)
+                put("category", item.category)
+                put("colorIdx", item.colorIdx)
+                put("notes", item.notes)
             }
             jsonArray.put(jsonObject)
         }
@@ -56,6 +65,114 @@ object ReminderStorage {
 
         // גיבוי לחשבון Google (אם מחוברים)
         CloudSync.push(context)
+    }
+
+    // ───────── History of passed / deleted reminders ─────────
+
+    private fun reminderToJson(item: ReminderItem) = JSONObject().apply {
+        put("id", item.id)
+        put("title", item.title)
+        put("time", item.time)
+        put("date", item.date)
+        put("isEnabled", item.isEnabled)
+        put("isDaily", item.isDaily)
+        put("repeatType", item.repeatType)
+        put("soundUri", item.soundUri ?: JSONObject.NULL)
+        put("advanceMinutes", item.advanceMinutes)
+        put("ringSeconds", item.ringSeconds)
+        put("category", item.category)
+        put("colorIdx", item.colorIdx)
+        put("notes", item.notes)
+    }
+
+    private fun reminderFromJson(obj: JSONObject) = ReminderItem(
+        id = obj.getInt("id"),
+        title = obj.getString("title"),
+        time = obj.getString("time"),
+        date = obj.optString("date", ""),
+        isEnabled = obj.optBoolean("isEnabled", true),
+        isDaily = obj.optBoolean("isDaily", false),
+        repeatType = obj.optString("repeatType", "NONE"),
+        soundUri = if (obj.has("soundUri") && !obj.isNull("soundUri")) obj.getString("soundUri") else null,
+        advanceMinutes = obj.optInt("advanceMinutes", 0),
+        ringSeconds = obj.optInt("ringSeconds", 0),
+        category = obj.optString("category", ""),
+        colorIdx = obj.optInt("colorIdx", -1),
+        notes = obj.optString("notes", "")
+    )
+
+    fun loadHistory(context: Context): List<HistoryEntry> {
+        val json = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_HISTORY, null)
+        if (json.isNullOrEmpty()) return emptyList()
+        val list = mutableListOf<HistoryEntry>()
+        try {
+            val array = JSONArray(json)
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                list.add(
+                    HistoryEntry(
+                        reminder = reminderFromJson(obj.getJSONObject("reminder")),
+                        reason = obj.optString("reason", "PASSED"),
+                        at = obj.optLong("at", 0L)
+                    )
+                )
+            }
+        } catch (_: Exception) {
+        }
+        return list
+    }
+
+    private fun saveHistory(context: Context, list: List<HistoryEntry>) {
+        saveHistoryLocal(context, list)
+        CloudSync.push(context)
+    }
+
+    private fun saveHistoryLocal(context: Context, list: List<HistoryEntry>) {
+        val array = JSONArray()
+        list.forEach { entry ->
+            array.put(
+                JSONObject().apply {
+                    put("reminder", reminderToJson(entry.reminder))
+                    put("reason", entry.reason)
+                    put("at", entry.at)
+                }
+            )
+        }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putString(KEY_HISTORY, array.toString()) }
+    }
+
+    /** Newest first. reason = "PASSED" or "DELETED". */
+    fun addToHistory(context: Context, items: List<ReminderItem>, reason: String) {
+        if (items.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val list = loadHistory(context).toMutableList()
+        items.forEach { list.add(0, HistoryEntry(it, reason, now)) }
+        saveHistory(context, list.take(HISTORY_LIMIT))
+    }
+
+    fun removeFromHistory(context: Context, at: Long, reminderId: Int) {
+        saveHistory(context, loadHistory(context).filterNot { it.at == at && it.reminder.id == reminderId })
+    }
+
+    fun clearHistory(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { remove(KEY_HISTORY) }
+        CloudSync.push(context)
+    }
+
+    /** The history exactly as stored, for the cloud backup. */
+    fun getHistoryJson(context: Context): String =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_HISTORY, null) ?: "[]"
+
+    /** Replaces the history on the phone with the one from the cloud. */
+    fun replaceHistoryFromCloud(context: Context, json: String) {
+        val valid = try {
+            JSONArray(json)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (!valid) return
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putString(KEY_HISTORY, json) }
     }
 
     /** The saved reminders exactly as stored, for the cloud backup. */
@@ -88,6 +205,7 @@ object ReminderStorage {
             putString(KEY_REMINDERS, "[]")
             putBoolean(KEY_INITIALIZED, true)
         }
+        clearHistory(context)
         AlarmService.stop(context)
         refreshWidgets(context)
     }
@@ -163,7 +281,10 @@ object ReminderStorage {
                             repeatType = obj.optString("repeatType", "NONE"),
                             soundUri = if (obj.has("soundUri") && !obj.isNull("soundUri")) obj.getString("soundUri") else null,
                             advanceMinutes = obj.optInt("advanceMinutes", 0),
-                            ringSeconds = obj.optInt("ringSeconds", 0)
+                            ringSeconds = obj.optInt("ringSeconds", 0),
+                            category = obj.optString("category", ""),
+                            colorIdx = obj.optInt("colorIdx", -1),
+                            notes = obj.optString("notes", "")
                         )
                     )
                 }
